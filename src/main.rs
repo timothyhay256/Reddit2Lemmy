@@ -337,54 +337,56 @@ async fn main() {
                                         // Apply score to comment
                                         // TODO: Make a function, reduce uneeded DB requests, just clean up in general
 
-                                        for _ in 0..cmp::min(
-                                            comment.score - voting_users.len() as i32,
-                                            0,
-                                        ) {
-                                            let rand_string: String = rand::rng()
-                                                .sample_iter(&Alphanumeric)
-                                                .take(7)
-                                                .map(char::from)
+                                        if comment.score.is_positive() {
+                                            for _ in 0..cmp::min(
+                                                comment.score - voting_users.len() as i32,
+                                                0,
+                                            ) {
+                                                let rand_string: String = rand::rng()
+                                                    .sample_iter(&Alphanumeric)
+                                                    .take(7)
+                                                    .map(char::from)
+                                                    .collect();
+
+                                                let username = format!("voteuser-{rand_string}");
+
+                                                debug!("Adding {username} as a voteuser");
+
+                                                voting_users.push(
+                                                    get_or_create_user(
+                                                        &username,
+                                                        &site_view,
+                                                        &mut db_pool,
+                                                        &new_user_password_hash,
+                                                    )
+                                                    .await,
+                                                );
+                                            }
+
+                                            let mut voting_users_trunc = voting_users.clone();
+                                            voting_users_trunc
+                                                .truncate(comment.score.try_into().unwrap());
+
+                                            let like_form_conn =
+                                                &mut get_conn(&mut db_pool).await.unwrap();
+                                            let like_forms: Vec<_> = voting_users_trunc
+                                                .iter()
+                                                .map(|user| CommentLikeForm {
+                                                    comment_id: new_lemmy_comment_id,
+                                                    post_id: lemmy_post_id,
+                                                    person_id: user.id,
+                                                    score: 1,
+                                                })
                                                 .collect();
 
-                                            let username = format!("voteuser-{rand_string}");
-
-                                            debug!("Adding {username} as a voteuser");
-
-                                            voting_users.push(
-                                                get_or_create_user(
-                                                    &username,
-                                                    &site_view,
-                                                    &mut db_pool,
-                                                    &new_user_password_hash,
-                                                )
-                                                .await,
-                                            );
+                                            insert_into(comment_like::table)
+                                                .values(&like_forms)
+                                                .execute(like_form_conn)
+                                                .await
+                                                .unwrap();
+                                            reddit_lemmy_id
+                                                .insert(comment.id.clone(), new_lemmy_comment_id);
                                         }
-
-                                        let mut voting_users_trunc = voting_users.clone();
-                                        voting_users_trunc
-                                            .truncate(comment.score.try_into().unwrap());
-
-                                        let like_form_conn =
-                                            &mut get_conn(&mut db_pool).await.unwrap();
-                                        let like_forms: Vec<_> = voting_users_trunc
-                                            .iter()
-                                            .map(|user| CommentLikeForm {
-                                                comment_id: new_lemmy_comment_id,
-                                                post_id: lemmy_post_id,
-                                                person_id: user.id,
-                                                score: 1,
-                                            })
-                                            .collect();
-
-                                        insert_into(comment_like::table)
-                                            .values(&like_forms)
-                                            .execute(like_form_conn)
-                                            .await
-                                            .unwrap();
-                                        reddit_lemmy_id
-                                            .insert(comment.id.clone(), new_lemmy_comment_id);
                                     }
                                 }
                             }
