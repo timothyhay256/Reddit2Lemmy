@@ -407,16 +407,18 @@ async fn get_or_create_user(
     db_pool: &mut DbPool<'_>,
     new_user_password_hash: &String,
 ) -> Person {
-    match Person::read_from_name(db_pool, &username, false).await {
+    let username = format!("{username}-mirror");
+    let mut username_trunc = username.clone();
+    username_trunc.truncate(20);
+
+    match Person::read_from_name(db_pool, &username_trunc, false).await {
         Ok(user) => match user {
             Some(user) => user,
             None => {
-                let username = format!("{username}-mirror");
-                let mut username_trunc = username.clone();
-
-                username_trunc.truncate(20);
-
-                info!("User {} not found, creating a local user...", &username);
+                info!(
+                    "User {} not found, creating a local user...",
+                    &username_trunc
+                );
 
                 let person_form = PersonInsertForm::new(
                     username_trunc.clone(),
