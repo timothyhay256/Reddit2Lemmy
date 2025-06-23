@@ -1,13 +1,17 @@
 use std::{
+    // TODO: Paralellize, reduce uneeded DB reads, batch writes
+    cmp,
+    collections::HashMap,
     env,
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use bcrypt::{DEFAULT_COST, hash};
 use chrono::{TimeZone, Utc};
-use diesel::{OptionalExtension, QueryDsl, expression_methods::ExpressionMethods};
+use diesel::{OptionalExtension, QueryDsl, expression_methods::ExpressionMethods, insert_into};
 use diesel_async::RunQueryDsl;
 use gumdrop::Options;
 use lemmy_db_views::structs::SiteView;
@@ -16,16 +20,23 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use lemmy_db_schema::{
-    schema::{person, post},
+    newtypes::CommentId,
+    schema::{
+        comment_like, person, post,
+        post_like::{self, table},
+    },
     source::{
+        comment::{Comment, CommentInsertForm, CommentLikeForm},
+        comment_reply::CommentReplyInsertForm,
         community::Community,
         local_user::{LocalUser, LocalUserInsertForm},
         person::{Person, PersonInsertForm},
-        post::{Post, PostInsertForm},
+        post::{Post, PostInsertForm, PostLike, PostLikeForm},
     },
-    traits::{ApubActor, Crud},
+    traits::{ApubActor, Crud, Likeable},
     utils::{DbPool, build_db_pool, get_conn},
 };
+use rand::{Rng, distr::Alphanumeric};
 
 #[derive(Debug, Options)]
 struct CommandOptions {
@@ -156,85 +167,228 @@ async fn main() {
 
                 match Community::read_from_name(&mut db_pool, &community_name, false).await {
                     Ok(community_id) => {
-                        match Person::read_from_name(&mut db_pool, &post.author, false).await {
-                            Ok(user) => {
-                                let user_id = match user {
-                                    Some(user) => user.id,
-                                    None => {
+                        let user_id = get_or_create_user(
+                            &post.author,
+                            &site_view,
+                            &mut db_pool,
+                            &new_user_password_hash,
+                        )
+                        .await
+                        .id;
+
+                        let conn = &mut get_conn(&mut db_pool).await.unwrap();
+
+                        match post::table
+                            .filter(post::name.eq(post.title.clone()))
+                            .filter(post::body.eq(post.selftext.clone()))
+                            .first::<Post>(conn)
+                            .await
+                            .optional()
+                            .unwrap()
+                        {
+                            Some(_) => {
+                                info!("Skipping duplicate post {}", post.title.clone())
+                            }
+                            None => {
+                                if !import_options.gen_users_only {
+                                    let publish_date = Utc
+                                        .timestamp_opt(post.created_utc.trunc() as i64, 0)
+                                        .unwrap();
+
+                                    let mut title_trunc = post.title.clone();
+                                    title_trunc.truncate(200);
+
+                                    let lemmy_post = PostInsertForm::builder()
+                                        .name(title_trunc)
+                                        .creator_id(user_id)
+                                        .community_id(community_id.unwrap().id)
+                                        .nsfw(Some(post.over_18))
+                                        .body(Some(post.selftext))
+                                        .published(Some(publish_date))
+                                        .build();
+
+                                    info!("Inserting {} into DB", post.title);
+
+                                    // In order to properly federate, each vote must come from an user. So we use all the users we have to vote, and then generate lots of dummys for the remaining votes.
+                                    let mut voting_users =
+                                        person::table.load::<Person>(conn).await.unwrap();
+
+                                    for _ in 0..cmp::min(post.score - voting_users.len() as i32, 0)
+                                    {
+                                        let rand_string: String = rand::rng()
+                                            .sample_iter(&Alphanumeric)
+                                            .take(7)
+                                            .map(char::from)
+                                            .collect();
+
+                                        let username = format!("voteuser-{rand_string}");
+
+                                        debug!("Adding {username} as a voteuser");
+
+                                        voting_users.push(
+                                            get_or_create_user(
+                                                &username,
+                                                &site_view,
+                                                &mut db_pool,
+                                                &new_user_password_hash,
+                                            )
+                                            .await,
+                                        );
+                                    }
+
+                                    let lemmy_post_id =
+                                        Post::create(&mut db_pool, &lemmy_post).await.unwrap().id;
+
+                                    let mut voting_users_trunc = voting_users.clone();
+                                    voting_users_trunc.truncate(post.score.try_into().unwrap()); // Now we can just iterate through voting_users_trunc
+
+                                    let like_form_conn = &mut get_conn(&mut db_pool).await.unwrap();
+                                    let like_forms: Vec<_> = voting_users_trunc
+                                        .iter()
+                                        .map(|user| PostLikeForm {
+                                            post_id: lemmy_post_id,
+                                            person_id: user.id,
+                                            score: 1,
+                                        })
+                                        .collect();
+
+                                    insert_into(post_like::table)
+                                        .values(&like_forms)
+                                        .execute(like_form_conn)
+                                        .await
+                                        .unwrap();
+
+                                    // Insert comments
+
+                                    let mut flat_comments = Vec::new();
+                                    walk_comments(None, &post.comments, &mut flat_comments);
+
+                                    let mut reddit_lemmy_id: HashMap<String, CommentId> =
+                                        HashMap::new();
+                                    // Since walking the path will always insert parent comments first, we can insert the comment Reddit id and Lemmy id
+                                    // allowing us to use the reddit coment parent id to determine the correct parent to set a reply to.
+
+                                    for (parent_id, comment) in flat_comments {
+                                        debug!(
+                                            "Inserting comment with Comment ID: {}, Parent ID: {:?}, Body: {}",
+                                            comment.id, parent_id, comment.body
+                                        );
                                         info!(
-                                            "User {} not found, creating a local user...",
-                                            &post.author
+                                            "Inserting comment with score {}: '{}'",
+                                            comment.score, comment.body
                                         );
 
-                                        let person_form = PersonInsertForm::new(
-                                            post.author.clone(),
-                                            site_view.site.public_key.clone(),
-                                            site_view.site.instance_id,
-                                        );
+                                        let author_id = get_or_create_user(
+                                            &comment.author,
+                                            &site_view,
+                                            &mut db_pool,
+                                            &new_user_password_hash,
+                                        )
+                                        .await
+                                        .id;
 
-                                        let new_user = Person::create(&mut db_pool, &person_form)
-                                            .await
+                                        let publish_date = Utc
+                                            .timestamp_opt(comment.created_utc.trunc() as i64, 0)
                                             .unwrap();
 
-                                        let local_user_form = LocalUserInsertForm::new(
-                                            new_user.id,
-                                            new_user_password_hash.clone(),
-                                        );
+                                        let lemmy_comment = CommentInsertForm::builder()
+                                            .creator_id(author_id)
+                                            .post_id(lemmy_post_id)
+                                            .content(comment.body.clone())
+                                            .published(Some(publish_date))
+                                            .build();
 
-                                        LocalUser::create(&mut db_pool, &local_user_form, vec![])
-                                            .await
-                                            .unwrap();
-
-                                        new_user.id
-                                    }
-                                };
-
-                                let conn = &mut get_conn(&mut db_pool).await.unwrap();
-
-                                match post::table
-                                    .filter(post::name.eq(post.title.clone()))
-                                    .filter(post::body.eq(post.selftext.clone()))
-                                    .first::<Post>(conn)
-                                    .await
-                                    .optional()
-                                    .unwrap()
-                                {
-                                    Some(_) => {
-                                        info!("Skipping duplicate post {}", post.title.clone())
-                                    }
-                                    None => {
-                                        if !import_options.gen_users_only {
-                                            let publish_date = Utc
-                                                .timestamp_opt(post.created_utc.trunc() as i64, 0)
-                                                .unwrap();
-
-                                            let lemmy_post = PostInsertForm::builder()
-                                                .name(post.title.clone())
-                                                .creator_id(user_id)
-                                                .community_id(community_id.unwrap().id)
-                                                .nsfw(Some(post.over_18))
-                                                .body(Some(post.selftext))
-                                                .published(Some(publish_date))
-                                                .build();
-
-                                            // // In order to properly federate, each vote must come from an user. So we use all the users we have to vote, and then generate lots of dummys for the remaining votes.
-                                            // let current_users =
-                                            //     person::table.load::<Person>(conn).await.unwrap();
-
-                                            info!("Inserting {} into DB", post.title);
-
-                                            let _lemmy_post =
-                                                Post::create(&mut db_pool, &lemmy_post)
+                                        let new_lemmy_comment_id = {
+                                            if parent_id.is_none() {
+                                                Comment::create(&mut db_pool, &lemmy_comment, None)
                                                     .await
-                                                    .unwrap();
+                                                    .unwrap()
+                                                    .id
+                                            } else {
+                                                let lemmy_parent_id = reddit_lemmy_id
+                                                    .get(parent_id.unwrap())
+                                                    .unwrap(); // Unwrap since walk_comments should always run in order
+
+                                                let parent_comment_path =
+                                                    Comment::read(&mut db_pool, *lemmy_parent_id)
+                                                        .await
+                                                        .unwrap()
+                                                        .unwrap()
+                                                        .path;
+
+                                                let new_lemmy_comment_id = Comment::create(
+                                                    &mut db_pool,
+                                                    &lemmy_comment,
+                                                    Some(&parent_comment_path),
+                                                )
+                                                .await
+                                                .unwrap()
+                                                .id;
+
+                                                reddit_lemmy_id.insert(
+                                                    comment.id.clone(),
+                                                    new_lemmy_comment_id,
+                                                );
+
+                                                new_lemmy_comment_id
+                                            }
+                                        };
+
+                                        // Apply score to comment
+                                        // TODO: Make a function, reduce uneeded DB requests, just clean up in general
+
+                                        for _ in 0..cmp::min(
+                                            comment.score - voting_users.len() as i32,
+                                            0,
+                                        ) {
+                                            let rand_string: String = rand::rng()
+                                                .sample_iter(&Alphanumeric)
+                                                .take(7)
+                                                .map(char::from)
+                                                .collect();
+
+                                            let username = format!("voteuser-{rand_string}");
+
+                                            debug!("Adding {username} as a voteuser");
+
+                                            voting_users.push(
+                                                get_or_create_user(
+                                                    &username,
+                                                    &site_view,
+                                                    &mut db_pool,
+                                                    &new_user_password_hash,
+                                                )
+                                                .await,
+                                            );
                                         }
+
+                                        let mut voting_users_trunc = voting_users.clone();
+                                        voting_users_trunc
+                                            .truncate(comment.score.try_into().unwrap());
+
+                                        let like_form_conn =
+                                            &mut get_conn(&mut db_pool).await.unwrap();
+                                        let like_forms: Vec<_> = voting_users_trunc
+                                            .iter()
+                                            .map(|user| CommentLikeForm {
+                                                comment_id: new_lemmy_comment_id,
+                                                post_id: lemmy_post_id,
+                                                person_id: user.id,
+                                                score: 1,
+                                            })
+                                            .collect();
+
+                                        insert_into(comment_like::table)
+                                            .values(&like_forms)
+                                            .execute(like_form_conn)
+                                            .await
+                                            .unwrap();
+                                        reddit_lemmy_id
+                                            .insert(comment.id.clone(), new_lemmy_comment_id);
                                     }
-                                };
+                                }
                             }
-                            Err(e) => {
-                                error!("Lemmy user doesn't exist: {e}")
-                            }
-                        };
+                        }
                     }
                     Err(e) => {
                         error!("Lemmy community doesn't exist: {e}")
@@ -242,5 +396,55 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+async fn get_or_create_user(
+    username: &String,
+    site_view: &SiteView,
+    db_pool: &mut DbPool<'_>,
+    new_user_password_hash: &String,
+) -> Person {
+    match Person::read_from_name(db_pool, &username, false).await {
+        Ok(user) => match user {
+            Some(user) => user,
+            None => {
+                let username = format!("{username}-mirror");
+                let mut username_trunc = username.clone();
+
+                username_trunc.truncate(20);
+
+                info!("User {} not found, creating a local user...", &username);
+
+                let person_form = PersonInsertForm::new(
+                    username_trunc.clone(),
+                    site_view.site.public_key.clone(),
+                    site_view.site.instance_id,
+                );
+
+                let new_user = Person::create(db_pool, &person_form).await.unwrap();
+
+                let local_user_form =
+                    LocalUserInsertForm::new(new_user.id, new_user_password_hash.clone());
+
+                LocalUser::create(db_pool, &local_user_form, vec![])
+                    .await
+                    .unwrap();
+
+                new_user
+            }
+        },
+        Err(e) => panic!("Couldn't query db: {e}"),
+    }
+}
+
+fn walk_comments<'a>(
+    parent_id: Option<&'a str>,
+    comments: &'a [RedditComment],
+    out: &mut Vec<(Option<&'a str>, &'a RedditComment)>,
+) {
+    for comment in comments {
+        out.push((parent_id, comment));
+        walk_comments(Some(&comment.id), &comment.replies, out);
     }
 }
