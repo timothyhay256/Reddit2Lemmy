@@ -313,6 +313,8 @@ async fn main() {
                                                     comment.id.clone(),
                                                     new_lemmy_comment_id,
                                                 );
+
+                                                new_lemmy_comment_id
                                             } else {
                                                 let lemmy_parent_id = reddit_lemmy_id
                                                     .get(parent_id.unwrap())
