@@ -300,10 +300,19 @@ async fn main() {
 
                                         let new_lemmy_comment_id = {
                                             if parent_id.is_none() {
-                                                Comment::create(&mut db_pool, &lemmy_comment, None)
-                                                    .await
-                                                    .unwrap()
-                                                    .id
+                                                let new_lemmy_comment_id = Comment::create(
+                                                    &mut db_pool,
+                                                    &lemmy_comment,
+                                                    None,
+                                                )
+                                                .await
+                                                .unwrap()
+                                                .id;
+
+                                                reddit_lemmy_id.insert(
+                                                    comment.id.clone(),
+                                                    new_lemmy_comment_id,
+                                                );
                                             } else {
                                                 let lemmy_parent_id = reddit_lemmy_id
                                                     .get(parent_id.unwrap())
