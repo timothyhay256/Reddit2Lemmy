@@ -10,6 +10,7 @@ chrono = "0.4.41"
 diesel = { version = "2.1.6" }
 diesel-async = "0.4.1"
 env_logger = "0.11.8"
+futures = "0.3.31"
 gumdrop = "0.8.1"
 lemmy_db_schema = { version = "0.19.12", features = ["full"] }
 lemmy_db_views = { version = "0.19.12", features = ["full"] }

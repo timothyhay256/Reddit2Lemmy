@@ -3335,6 +3335,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "env_logger",
+ "futures",
  "gumdrop",
  "lemmy_db_schema",
  "lemmy_db_views",
