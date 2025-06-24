@@ -160,11 +160,15 @@ async fn main() {
             let mut db_pool = DbPool::Pool(&owned_pool);
 
             if path.is_file() {
-                let file = File::open(path).unwrap();
-                let reader = BufReader::new(file);
 
-                let post: RedditPost =
-                    serde_json::from_reader(reader).expect("Unable to parse post:");
+                let post: RedditPost = tokio::task::spawn_blocking(move || {
+                    let file = File::open(path).unwrap();
+                    let reader = BufReader::new(file);
+                    serde_json::from_reader(reader)
+                })
+                .await
+                .unwrap()
+                .expect("Unable to parse post");
 
                 // Post::create(&mut db_pool, form);
                 let community_name = post
@@ -430,7 +434,7 @@ async fn get_or_create_user(
     username: &String,
     site_view: &SiteView,
     db_pool: &mut DbPool<'_>,
-    new_user_password_hash: &String,
+    new_user_password_hash: &str,
 ) -> Person {
     let username = format!("{username}-mirror");
     let mut username_trunc = username.clone();
@@ -454,7 +458,7 @@ async fn get_or_create_user(
                 let new_user = Person::create(db_pool, &person_form).await.unwrap();
 
                 let local_user_form =
-                    LocalUserInsertForm::new(new_user.id, new_user_password_hash.clone());
+                    LocalUserInsertForm::new(new_user.id, new_user_password_hash.to_owned());
 
                 LocalUser::create(db_pool, &local_user_form, vec![])
                     .await
