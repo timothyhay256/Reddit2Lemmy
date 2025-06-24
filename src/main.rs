@@ -13,6 +13,7 @@ use bcrypt::{DEFAULT_COST, hash};
 use chrono::{TimeZone, Utc};
 use diesel::{OptionalExtension, QueryDsl, expression_methods::ExpressionMethods, insert_into};
 use diesel_async::RunQueryDsl;
+use futures::{StreamExt, stream};
 use gumdrop::Options;
 use lemmy_db_views::structs::SiteView;
 use log::{LevelFilter, debug, error, info};
@@ -132,6 +133,7 @@ async fn main() {
     let actual_pool = build_db_pool()
         .await
         .expect("Failed to create Lemmy DB pool");
+
     // Wrap it as a DbPool for use in Lemmy functions
     let mut db_pool = DbPool::Pool(&actual_pool);
 
@@ -144,12 +146,23 @@ async fn main() {
 
         info!("Inserting archives inside {} into Lemmy DB", path.display());
 
-        for entry in WalkDir::new(path) {
-            // TODO: Increase speed with concurrency
-            let entry = entry.as_ref().unwrap().path();
+        let concurrency_limit = 50;
 
-            if entry.is_file() {
-                let file = File::open(entry).unwrap();
+        let entries = WalkDir::new(path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.into_path());
+
+        stream::iter(entries).map(|path: PathBuf|{
+            let owned_pool = actual_pool.clone();
+            let site_view = site_view.clone();
+            let new_user_password_hash = new_user_password_hash.clone();
+            async move {
+            let mut db_pool = DbPool::Pool(&owned_pool);
+
+            if path.is_file() {
+                let file = File::open(path).unwrap();
                 let reader = BufReader::new(file);
 
                 let post: RedditPost =
@@ -405,10 +418,13 @@ async fn main() {
                     }
                     Err(e) => {
                         error!("Lemmy community doesn't exist: {e}")
-                    }
+                    }}
                 }
             }
-        }
+        })
+        .buffer_unordered(concurrency_limit)
+        .collect::<Vec<_>>() // Collect to drive the stream to completion
+        .await;
     }
 }
 
