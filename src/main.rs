@@ -6,7 +6,6 @@ use std::{
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use bcrypt::{DEFAULT_COST, hash};
@@ -24,17 +23,16 @@ use lemmy_db_schema::{
     newtypes::CommentId,
     schema::{
         comment_like, person, post,
-        post_like::{self, table},
+        post_like::{self},
     },
     source::{
         comment::{Comment, CommentInsertForm, CommentLikeForm},
-        comment_reply::CommentReplyInsertForm,
         community::Community,
         local_user::{LocalUser, LocalUserInsertForm},
         person::{Person, PersonInsertForm},
-        post::{Post, PostInsertForm, PostLike, PostLikeForm},
+        post::{Post, PostInsertForm, PostLikeForm},
     },
-    traits::{ApubActor, Crud, Likeable},
+    traits::{ApubActor, Crud},
     utils::{DbPool, build_db_pool, get_conn},
 };
 use rand::{Rng, distr::Alphanumeric};
@@ -146,7 +144,7 @@ async fn main() {
 
         info!("Inserting archives inside {} into Lemmy DB", path.display());
 
-        let concurrency_limit = 50;
+        let concurrency_limit = 15;
 
         let entries = WalkDir::new(path)
             .into_iter()
@@ -191,8 +189,11 @@ async fn main() {
 
                         let conn = &mut get_conn(&mut db_pool).await.unwrap();
 
+                        let mut title_trunc = post.title.clone();
+                        title_trunc.truncate(200);
+
                         match post::table
-                            .filter(post::name.eq(post.title.clone()))
+                            .filter(post::name.eq(title_trunc.clone()))
                             .filter(post::body.eq(post.selftext.clone()))
                             .first::<Post>(conn)
                             .await
@@ -204,12 +205,11 @@ async fn main() {
                             }
                             None => {
                                 if !import_options.gen_users_only {
+                                    info!("Inserting post {} into DB", post.title);
+
                                     let publish_date = Utc
                                         .timestamp_opt(post.created_utc.trunc() as i64, 0)
                                         .unwrap();
-
-                                    let mut title_trunc = post.title.clone();
-                                    title_trunc.truncate(200);
 
                                     let lemmy_post = PostInsertForm::builder()
                                         .name(title_trunc)
@@ -219,8 +219,6 @@ async fn main() {
                                         .body(Some(post.selftext))
                                         .published(Some(publish_date))
                                         .build();
-
-                                    info!("Inserting {} into DB", post.title);
 
                                     // In order to properly federate, each vote must come from an user. So we use all the users we have to vote, and then generate lots of dummys for the remaining votes.
                                     let mut voting_users =
