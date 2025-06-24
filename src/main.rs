@@ -156,8 +156,12 @@ async fn main() {
             let owned_pool = actual_pool.clone();
             let site_view = site_view.clone();
             let new_user_password_hash = new_user_password_hash.clone();
+
             async move {
             let mut db_pool = DbPool::Pool(&owned_pool);
+
+            let mut db_pool_for_conn = DbPool::Pool(&owned_pool);
+            let mut conn = get_conn(&mut db_pool_for_conn).await.unwrap();
 
             if path.is_file() {
 
@@ -191,15 +195,13 @@ async fn main() {
                         .await
                         .id;
 
-                        let conn = &mut get_conn(&mut db_pool).await.unwrap();
-
                         let mut title_trunc = post.title.clone();
                         title_trunc.truncate(200);
 
                         match post::table
                             .filter(post::name.eq(title_trunc.clone()))
                             .filter(post::body.eq(post.selftext.clone()))
-                            .first::<Post>(conn)
+                            .first::<Post>(&mut conn)
                             .await
                             .optional()
                             .unwrap()
@@ -226,7 +228,7 @@ async fn main() {
 
                                     // In order to properly federate, each vote must come from an user. So we use all the users we have to vote, and then generate lots of dummys for the remaining votes.
                                     let mut voting_users =
-                                        person::table.load::<Person>(conn).await.unwrap();
+                                        person::table.load::<Person>(&mut conn).await.unwrap();
 
                                     for _ in 0..cmp::min(post.score - voting_users.len() as i32, 0)
                                     {
@@ -257,7 +259,6 @@ async fn main() {
                                     let mut voting_users_trunc = voting_users.clone();
                                     voting_users_trunc.truncate(post.score.try_into().unwrap()); // Now we can just iterate through voting_users_trunc
 
-                                    let like_form_conn = &mut get_conn(&mut db_pool).await.unwrap();
                                     let like_forms: Vec<_> = voting_users_trunc
                                         .iter()
                                         .map(|user| PostLikeForm {
@@ -269,7 +270,7 @@ async fn main() {
 
                                     insert_into(post_like::table)
                                         .values(&like_forms)
-                                        .execute(like_form_conn)
+                                        .execute(&mut conn)
                                         .await
                                         .unwrap();
 
@@ -393,8 +394,6 @@ async fn main() {
                                             voting_users_trunc
                                                 .truncate(comment.score.try_into().unwrap());
 
-                                            let like_form_conn =
-                                                &mut get_conn(&mut db_pool).await.unwrap();
                                             let like_forms: Vec<_> = voting_users_trunc
                                                 .iter()
                                                 .map(|user| CommentLikeForm {
@@ -407,7 +406,7 @@ async fn main() {
 
                                             insert_into(comment_like::table)
                                                 .values(&like_forms)
-                                                .execute(like_form_conn)
+                                                .execute(&mut conn)
                                                 .await
                                                 .unwrap();
                                             reddit_lemmy_id
