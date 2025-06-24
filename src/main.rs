@@ -285,8 +285,8 @@ async fn main() {
                                             comment.id, parent_id, comment.body
                                         );
                                         info!(
-                                            "Inserting comment with score {}: '{}'",
-                                            comment.score, comment.body
+                                            "Inserting comment with score {} by '{}'",
+                                            comment.score, comment.author
                                         );
 
                                         let author_id = get_or_create_user(
