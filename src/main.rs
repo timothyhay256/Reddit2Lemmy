@@ -108,7 +108,8 @@ pub struct RedditComment {
 
 impl RedditComment {
     fn count_recursive(&self) -> usize {
-        self.replies
+        1 + self
+            .replies
             .iter()
             .map(|reply| reply.count_recursive())
             .sum::<usize>()
@@ -117,8 +118,7 @@ impl RedditComment {
 
 impl RedditPost {
     fn count_recursive(&self) -> usize {
-        1 + self
-            .comments
+        self.comments
             .iter()
             .map(|reply| reply.count_recursive())
             .sum::<usize>()
@@ -234,6 +234,7 @@ async fn main() {
                                     true
                                 } else {
                                     info!("Updating post {} ({} -> {} comments)", post.title.clone(), post_comment_count, loaded_post_comments);
+                                    info!("Post content: {post:?}");
                                     false
                                 }
                             }
