@@ -272,33 +272,31 @@ async fn main() {
                             let mut voting_users =
                                 person::table.load::<Person>(&mut conn).await.unwrap();
 
-                            for _ in 0..cmp::min(post.score - voting_users.len() as i32, 0)
-                            {
+                            for _ in 0..post.score.saturating_sub(voting_users.len().try_into().unwrap()) {
                                 let rand_string: String = rand::rng()
-                                    .sample_iter(&Alphanumeric)
-                                    .take(7)
-                                    .map(char::from)
-                                    .collect();
+                                .sample_iter(&Alphanumeric)
+                                .take(7)
+                                .map(char::from)
+                                .collect();
 
                                 let username = format!("voteuser-{rand_string}");
-
                                 debug!("Adding {username} as a voteuser");
 
-                                voting_users.push(
-                                    get_or_create_user(
-                                        &username,
-                                        &site_view,
-                                        &mut db_pool,
-                                        &new_user_password_hash,
-                                    )
-                                    .await,
-                                );
+                                let user = get_or_create_user(
+                                    &username,
+                                    &site_view,
+                                    &mut db_pool,
+                                    &new_user_password_hash,
+                                ).await;
+
+                                voting_users.push(user);
                             }
 
                             let lemmy_post_id =
                                 Post::create(&mut db_pool, &lemmy_post).await.unwrap().id;
 
                             let mut voting_users_trunc = voting_users.clone();
+
                             voting_users_trunc.truncate(post.score.try_into().unwrap()); // Now we can just iterate through voting_users_trunc
 
                             let like_forms: Vec<_> = voting_users_trunc
@@ -406,54 +404,53 @@ async fn main() {
                                 // Apply score to comment
                                 // TODO: Make a function, reduce uneeded DB requests, just clean up in general
 
-                                if comment.score.is_positive() {
-                                    for _ in 0..cmp::min(
-                                        comment.score - voting_users.len() as i32,
-                                        0,
-                                    ) {
-                                        let rand_string: String = rand::rng()
-                                            .sample_iter(&Alphanumeric)
-                                            .take(7)
-                                            .map(char::from)
-                                            .collect();
+                                let score = comment.score;
+                                let vote_count = score.unsigned_abs() as usize;
 
-                                        let username = format!("voteuser-{rand_string}");
+                                for _ in 0..vote_count.saturating_sub(voting_users.len()) {
+                                    let rand_string: String = rand::rng()
+                                    .sample_iter(&Alphanumeric)
+                                    .take(7)
+                                    .map(char::from)
+                                    .collect();
 
-                                        debug!("Adding {username} as a voteuser");
+                                    let username = format!("voteuser-{rand_string}");
+                                    debug!("Adding {username} as a voteuser");
 
-                                        voting_users.push(
-                                            get_or_create_user(
-                                                &username,
-                                                &site_view,
-                                                &mut db_pool,
-                                                &new_user_password_hash,
-                                            )
-                                            .await,
-                                        );
-                                    }
+                                    let user = get_or_create_user(
+                                        &username,
+                                        &site_view,
+                                        &mut db_pool,
+                                        &new_user_password_hash,
+                                    ).await;
 
-                                    let mut voting_users_trunc = voting_users.clone();
-                                    voting_users_trunc
-                                        .truncate(comment.score.try_into().unwrap());
-
-                                    let like_forms: Vec<_> = voting_users_trunc
-                                        .iter()
-                                        .map(|user| CommentLikeForm {
-                                            comment_id: new_lemmy_comment_id,
-                                            post_id: lemmy_post_id,
-                                            person_id: user.id,
-                                            score: 1,
-                                        })
-                                        .collect();
-
-                                    insert_into(comment_like::table)
-                                        .values(&like_forms)
-                                        .execute(&mut conn)
-                                        .await
-                                        .unwrap();
-                                    reddit_lemmy_id
-                                        .insert(comment.id.clone(), new_lemmy_comment_id);
+                                    voting_users.push(user);
                                 }
+
+                                let mut voting_users_trunc = voting_users.clone();
+                                voting_users_trunc.truncate(vote_count);
+
+                                // Determine the score each vote should get
+                                let score_value = if score > 0 { 1 } else { -1 };
+
+                                let like_forms: Vec<_> = voting_users_trunc
+                                    .iter()
+                                    .map(|user| CommentLikeForm {
+                                        comment_id: new_lemmy_comment_id,
+                                        post_id: lemmy_post_id,
+                                        person_id: user.id,
+                                        score: score_value,
+                                    })
+                                    .collect();
+
+                                insert_into(comment_like::table)
+                                    .values(&like_forms)
+                                    .execute(&mut conn)
+                                    .await
+                                    .unwrap();
+
+                                reddit_lemmy_id.insert(comment.id.clone(), new_lemmy_comment_id);
+
                             }
                         }
                     }
