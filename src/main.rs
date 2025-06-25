@@ -65,6 +65,9 @@ struct ImportOptions {
 
     #[options(help = "just generate users without inserting posts")]
     gen_users_only: bool,
+
+    #[options(help = "force all posts to be not marked nsfw")]
+    dont_mark_nsfw: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,11 +252,18 @@ async fn main() {
                                 .timestamp_opt(post.created_utc.trunc() as i64, 0)
                                 .unwrap();
 
+                            let nsfw = {
+                                if import_options.dont_mark_nsfw {
+                                    false
+                                } else {
+                                    post.over_18
+                                }
+                            };
                             let lemmy_post = PostInsertForm::builder()
                                 .name(title_trunc)
                                 .creator_id(user_id)
                                 .community_id(community_id.unwrap().id)
-                                .nsfw(Some(post.over_18))
+                                .nsfw(Some(nsfw))
                                 .body(Some(post.selftext))
                                 .published(Some(publish_date))
                                 .build();
