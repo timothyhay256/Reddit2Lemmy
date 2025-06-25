@@ -299,12 +299,14 @@ async fn main() {
 
                             voting_users_trunc.truncate(post.score.try_into().unwrap()); // Now we can just iterate through voting_users_trunc
 
+                            let score_value = if post.score > 0 { 1 } else { -1 };
+
                             let like_forms: Vec<_> = voting_users_trunc
                                 .iter()
                                 .map(|user| PostLikeForm {
                                     post_id: lemmy_post_id,
                                     person_id: user.id,
-                                    score: 1,
+                                    score: score_value,
                                 })
                                 .collect();
 
