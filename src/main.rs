@@ -20,6 +20,7 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use lemmy_db_schema::{
+    aggregates::{post_aggregates, structs::PostAggregates},
     newtypes::CommentId,
     schema::{
         comment_like, person, post,
@@ -103,6 +104,25 @@ pub struct RedditComment {
     pub created_utc: f64,
     pub parent_id: String,
     pub replies: Vec<RedditComment>, // Recursively nested replies
+}
+
+impl RedditComment {
+    fn count_recursive(&self) -> usize {
+        self.replies
+            .iter()
+            .map(|reply| reply.count_recursive())
+            .sum::<usize>()
+    }
+}
+
+impl RedditPost {
+    fn count_recursive(&self) -> usize {
+        1 + self
+            .comments
+            .iter()
+            .map(|reply| reply.count_recursive())
+            .sum::<usize>()
+    }
 }
 
 #[tokio::main]
@@ -197,7 +217,7 @@ async fn main() {
 
                         let title_trunc: String = post.title.chars().take(200).collect();
 
-                        match post::table
+                        let skip_dupe = match post::table
                             .filter(post::name.eq(title_trunc.clone()))
                             .filter(post::body.eq(post.selftext.clone()))
                             .first::<Post>(&mut conn)
@@ -205,32 +225,182 @@ async fn main() {
                             .optional()
                             .unwrap()
                         {
-                            Some(_) => {
-                                info!("Skipping duplicate post {}", post.title.clone())
+                            Some(existing_post) => {
+                                let post_comment_count = PostAggregates::read(&mut db_pool, existing_post.id).await.unwrap().unwrap().comments;
+
+                                let loaded_post_comments = post.count_recursive();
+                                if loaded_post_comments == post_comment_count as usize {
+                                    info!("Skipping duplicate post {} with {} comments", post.title.clone(), post.comments.len());
+                                    true
+                                } else {
+                                    info!("Updating post {} ({} -> {} comments)", post.title.clone(), post_comment_count, loaded_post_comments);
+                                    false
+                                }
                             }
                             None => {
-                                if !import_options.gen_users_only {
-                                    info!("Inserting post {} into DB", post.title);
+                                false
+                            }
+                        };
 
-                                    let publish_date = Utc
-                                        .timestamp_opt(post.created_utc.trunc() as i64, 0)
-                                        .unwrap();
+                        if !skip_dupe && !import_options.gen_users_only {
+                            info!("Inserting post {} into DB", post.title);
 
-                                    let lemmy_post = PostInsertForm::builder()
-                                        .name(title_trunc)
-                                        .creator_id(user_id)
-                                        .community_id(community_id.unwrap().id)
-                                        .nsfw(Some(post.over_18))
-                                        .body(Some(post.selftext))
-                                        .published(Some(publish_date))
-                                        .build();
+                            let publish_date = Utc
+                                .timestamp_opt(post.created_utc.trunc() as i64, 0)
+                                .unwrap();
 
-                                    // In order to properly federate, each vote must come from an user. So we use all the users we have to vote, and then generate lots of dummys for the remaining votes.
-                                    let mut voting_users =
-                                        person::table.load::<Person>(&mut conn).await.unwrap();
+                            let lemmy_post = PostInsertForm::builder()
+                                .name(title_trunc)
+                                .creator_id(user_id)
+                                .community_id(community_id.unwrap().id)
+                                .nsfw(Some(post.over_18))
+                                .body(Some(post.selftext))
+                                .published(Some(publish_date))
+                                .build();
 
-                                    for _ in 0..cmp::min(post.score - voting_users.len() as i32, 0)
-                                    {
+                            // In order to properly federate, each vote must come from an user. So we use all the users we have to vote, and then generate lots of dummys for the remaining votes.
+                            let mut voting_users =
+                                person::table.load::<Person>(&mut conn).await.unwrap();
+
+                            for _ in 0..cmp::min(post.score - voting_users.len() as i32, 0)
+                            {
+                                let rand_string: String = rand::rng()
+                                    .sample_iter(&Alphanumeric)
+                                    .take(7)
+                                    .map(char::from)
+                                    .collect();
+
+                                let username = format!("voteuser-{rand_string}");
+
+                                debug!("Adding {username} as a voteuser");
+
+                                voting_users.push(
+                                    get_or_create_user(
+                                        &username,
+                                        &site_view,
+                                        &mut db_pool,
+                                        &new_user_password_hash,
+                                    )
+                                    .await,
+                                );
+                            }
+
+                            let lemmy_post_id =
+                                Post::create(&mut db_pool, &lemmy_post).await.unwrap().id;
+
+                            let mut voting_users_trunc = voting_users.clone();
+                            voting_users_trunc.truncate(post.score.try_into().unwrap()); // Now we can just iterate through voting_users_trunc
+
+                            let like_forms: Vec<_> = voting_users_trunc
+                                .iter()
+                                .map(|user| PostLikeForm {
+                                    post_id: lemmy_post_id,
+                                    person_id: user.id,
+                                    score: 1,
+                                })
+                                .collect();
+
+                            insert_into(post_like::table)
+                                .values(&like_forms)
+                                .execute(&mut conn)
+                                .await
+                                .unwrap();
+
+                            // Insert comments
+
+                            let mut flat_comments = Vec::new();
+                            walk_comments(None, &post.comments, &mut flat_comments);
+
+                            let mut reddit_lemmy_id: HashMap<String, CommentId> =
+                                HashMap::new();
+                            // Since walking the path will always insert parent comments first, we can insert the comment Reddit id and Lemmy id
+                            // allowing us to use the reddit coment parent id to determine the correct parent to set a reply to.
+
+                            for (parent_id, comment) in flat_comments {
+                                debug!(
+                                    "Inserting comment with Comment ID: {}, Parent ID: {:?}, Body: {}",
+                                    comment.id, parent_id, comment.body
+                                );
+                                info!(
+                                    "Inserting comment with score {} by '{}'",
+                                    comment.score, comment.author
+                                );
+
+                                let author_id = get_or_create_user(
+                                    &comment.author,
+                                    &site_view,
+                                    &mut db_pool,
+                                    &new_user_password_hash,
+                                )
+                                .await
+                                .id;
+
+                                let publish_date = Utc
+                                    .timestamp_opt(comment.created_utc.trunc() as i64, 0)
+                                    .unwrap();
+
+                                let lemmy_comment = CommentInsertForm::builder()
+                                    .creator_id(author_id)
+                                    .post_id(lemmy_post_id)
+                                    .content(comment.body.clone())
+                                    .published(Some(publish_date))
+                                    .build();
+
+                                let new_lemmy_comment_id = {
+                                    if parent_id.is_none() {
+                                        let new_lemmy_comment_id = Comment::create(
+                                            &mut db_pool,
+                                            &lemmy_comment,
+                                            None,
+                                        )
+                                        .await
+                                        .unwrap()
+                                        .id;
+
+                                        reddit_lemmy_id.insert(
+                                            comment.id.clone(),
+                                            new_lemmy_comment_id,
+                                        );
+
+                                        new_lemmy_comment_id
+                                    } else {
+                                        let lemmy_parent_id = reddit_lemmy_id
+                                            .get(parent_id.unwrap())
+                                            .unwrap(); // Unwrap since walk_comments should always run in order
+
+                                        let parent_comment_path =
+                                            Comment::read(&mut db_pool, *lemmy_parent_id)
+                                                .await
+                                                .unwrap()
+                                                .unwrap()
+                                                .path;
+
+                                        let new_lemmy_comment_id = Comment::create(
+                                            &mut db_pool,
+                                            &lemmy_comment,
+                                            Some(&parent_comment_path),
+                                        )
+                                        .await
+                                        .unwrap()
+                                        .id;
+
+                                        reddit_lemmy_id.insert(
+                                            comment.id.clone(),
+                                            new_lemmy_comment_id,
+                                        );
+
+                                        new_lemmy_comment_id
+                                    }
+                                };
+
+                                // Apply score to comment
+                                // TODO: Make a function, reduce uneeded DB requests, just clean up in general
+
+                                if comment.score.is_positive() {
+                                    for _ in 0..cmp::min(
+                                        comment.score - voting_users.len() as i32,
+                                        0,
+                                    ) {
                                         let rand_string: String = rand::rng()
                                             .sample_iter(&Alphanumeric)
                                             .take(7)
@@ -252,166 +422,27 @@ async fn main() {
                                         );
                                     }
 
-                                    let lemmy_post_id =
-                                        Post::create(&mut db_pool, &lemmy_post).await.unwrap().id;
-
                                     let mut voting_users_trunc = voting_users.clone();
-                                    voting_users_trunc.truncate(post.score.try_into().unwrap()); // Now we can just iterate through voting_users_trunc
+                                    voting_users_trunc
+                                        .truncate(comment.score.try_into().unwrap());
 
                                     let like_forms: Vec<_> = voting_users_trunc
                                         .iter()
-                                        .map(|user| PostLikeForm {
+                                        .map(|user| CommentLikeForm {
+                                            comment_id: new_lemmy_comment_id,
                                             post_id: lemmy_post_id,
                                             person_id: user.id,
                                             score: 1,
                                         })
                                         .collect();
 
-                                    insert_into(post_like::table)
+                                    insert_into(comment_like::table)
                                         .values(&like_forms)
                                         .execute(&mut conn)
                                         .await
                                         .unwrap();
-
-                                    // Insert comments
-
-                                    let mut flat_comments = Vec::new();
-                                    walk_comments(None, &post.comments, &mut flat_comments);
-
-                                    let mut reddit_lemmy_id: HashMap<String, CommentId> =
-                                        HashMap::new();
-                                    // Since walking the path will always insert parent comments first, we can insert the comment Reddit id and Lemmy id
-                                    // allowing us to use the reddit coment parent id to determine the correct parent to set a reply to.
-
-                                    for (parent_id, comment) in flat_comments {
-                                        debug!(
-                                            "Inserting comment with Comment ID: {}, Parent ID: {:?}, Body: {}",
-                                            comment.id, parent_id, comment.body
-                                        );
-                                        info!(
-                                            "Inserting comment with score {} by '{}'",
-                                            comment.score, comment.author
-                                        );
-
-                                        let author_id = get_or_create_user(
-                                            &comment.author,
-                                            &site_view,
-                                            &mut db_pool,
-                                            &new_user_password_hash,
-                                        )
-                                        .await
-                                        .id;
-
-                                        let publish_date = Utc
-                                            .timestamp_opt(comment.created_utc.trunc() as i64, 0)
-                                            .unwrap();
-
-                                        let lemmy_comment = CommentInsertForm::builder()
-                                            .creator_id(author_id)
-                                            .post_id(lemmy_post_id)
-                                            .content(comment.body.clone())
-                                            .published(Some(publish_date))
-                                            .build();
-
-                                        let new_lemmy_comment_id = {
-                                            if parent_id.is_none() {
-                                                let new_lemmy_comment_id = Comment::create(
-                                                    &mut db_pool,
-                                                    &lemmy_comment,
-                                                    None,
-                                                )
-                                                .await
-                                                .unwrap()
-                                                .id;
-
-                                                reddit_lemmy_id.insert(
-                                                    comment.id.clone(),
-                                                    new_lemmy_comment_id,
-                                                );
-
-                                                new_lemmy_comment_id
-                                            } else {
-                                                let lemmy_parent_id = reddit_lemmy_id
-                                                    .get(parent_id.unwrap())
-                                                    .unwrap(); // Unwrap since walk_comments should always run in order
-
-                                                let parent_comment_path =
-                                                    Comment::read(&mut db_pool, *lemmy_parent_id)
-                                                        .await
-                                                        .unwrap()
-                                                        .unwrap()
-                                                        .path;
-
-                                                let new_lemmy_comment_id = Comment::create(
-                                                    &mut db_pool,
-                                                    &lemmy_comment,
-                                                    Some(&parent_comment_path),
-                                                )
-                                                .await
-                                                .unwrap()
-                                                .id;
-
-                                                reddit_lemmy_id.insert(
-                                                    comment.id.clone(),
-                                                    new_lemmy_comment_id,
-                                                );
-
-                                                new_lemmy_comment_id
-                                            }
-                                        };
-
-                                        // Apply score to comment
-                                        // TODO: Make a function, reduce uneeded DB requests, just clean up in general
-
-                                        if comment.score.is_positive() {
-                                            for _ in 0..cmp::min(
-                                                comment.score - voting_users.len() as i32,
-                                                0,
-                                            ) {
-                                                let rand_string: String = rand::rng()
-                                                    .sample_iter(&Alphanumeric)
-                                                    .take(7)
-                                                    .map(char::from)
-                                                    .collect();
-
-                                                let username = format!("voteuser-{rand_string}");
-
-                                                debug!("Adding {username} as a voteuser");
-
-                                                voting_users.push(
-                                                    get_or_create_user(
-                                                        &username,
-                                                        &site_view,
-                                                        &mut db_pool,
-                                                        &new_user_password_hash,
-                                                    )
-                                                    .await,
-                                                );
-                                            }
-
-                                            let mut voting_users_trunc = voting_users.clone();
-                                            voting_users_trunc
-                                                .truncate(comment.score.try_into().unwrap());
-
-                                            let like_forms: Vec<_> = voting_users_trunc
-                                                .iter()
-                                                .map(|user| CommentLikeForm {
-                                                    comment_id: new_lemmy_comment_id,
-                                                    post_id: lemmy_post_id,
-                                                    person_id: user.id,
-                                                    score: 1,
-                                                })
-                                                .collect();
-
-                                            insert_into(comment_like::table)
-                                                .values(&like_forms)
-                                                .execute(&mut conn)
-                                                .await
-                                                .unwrap();
-                                            reddit_lemmy_id
-                                                .insert(comment.id.clone(), new_lemmy_comment_id);
-                                        }
-                                    }
+                                    reddit_lemmy_id
+                                        .insert(comment.id.clone(), new_lemmy_comment_id);
                                 }
                             }
                         }
