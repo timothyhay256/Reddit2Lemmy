@@ -195,8 +195,7 @@ async fn main() {
                         .await
                         .id;
 
-                        let mut title_trunc = post.title.clone();
-                        title_trunc.truncate(200);
+                        let title_trunc: String = post.title.chars().take(200).collect();
 
                         match post::table
                             .filter(post::name.eq(title_trunc.clone()))
@@ -436,8 +435,7 @@ async fn get_or_create_user(
     new_user_password_hash: &str,
 ) -> Person {
     let username = format!("{username}-mirror");
-    let mut username_trunc = username.clone();
-    username_trunc.truncate(20);
+    let username_trunc: String = username.chars().take(20).collect();
 
     match Person::read_from_name(db_pool, &username_trunc, false).await {
         Ok(user) => match user {
