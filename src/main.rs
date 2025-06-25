@@ -234,7 +234,6 @@ async fn main() {
                                     true
                                 } else {
                                     info!("Updating post {} ({} -> {} comments)", post.title.clone(), post_comment_count, loaded_post_comments);
-                                    info!("Post content: {post:?}");
                                     false
                                 }
                             }
