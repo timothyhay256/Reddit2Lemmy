@@ -22,7 +22,7 @@ use walkdir::WalkDir;
 
 use lemmy_db_schema::{
     aggregates::structs::{CommunityAggregates, PostAggregates},
-    newtypes::CommentId,
+    newtypes::{CommentId, PersonId, PostId},
     schema::{
         comment_like, person, post,
         post_like::{self},
@@ -35,7 +35,7 @@ use lemmy_db_schema::{
         post::{Post, PostInsertForm, PostLikeForm},
     },
     traits::{ApubActor, Crud},
-    utils::{DbPool, build_db_pool, get_conn},
+    utils::{build_db_pool, get_conn, DbPool},
 };
 use rand::{Rng, distr::Alphanumeric};
 
@@ -196,15 +196,19 @@ async fn main() {
             .unwrap();
 
         info!("Loading existing posts from db...");
-        let post_list = post::table.load::<Post>(&mut initial_conn).await.unwrap();
+        let post_list_vec = post::table.load::<Post>(&mut initial_conn).await.unwrap();
+
+        let post_list: HashMap<(String, String), PostId> = post_list_vec.into_iter().map(|p| ((p.name, p.body.unwrap()), p.id)).collect();
 
         info!("Loading post metadata from db...");
-        let post_aggregates_list = lemmy_db_schema::schema::post_aggregates::table
+        let post_aggregates_list_vec = lemmy_db_schema::schema::post_aggregates::table
             .load::<PostAggregates>(&mut initial_conn)
             .await
             .unwrap();
 
-        info!("Loading communities from db...");
+        let post_aggregates_list: HashMap<PostId, i64> = post_aggregates_list_vec.into_iter().map(|pa| (pa.post_id, pa.comments)).collect();
+
+        info!("Loading communities from db..."); // Don't put in HashMap since it's likely very short list
         let community_list = lemmy_db_schema::schema::community::table
             .load::<Community>(&mut initial_conn)
             .await
@@ -255,15 +259,13 @@ async fn main() {
 
                         let title_trunc: String = post.title.chars().take(200).collect();
 
-                        let skip_dupe = match post_list
-                        .iter()
-                        .find(|p| p.name == title_trunc && p.body == Some(post.selftext.clone()))
+                        let skip_dupe = match post_list.get(&(title_trunc.clone(), post.selftext.clone()))
                         {
-                            Some(existing_post) => {
-                                let post_comment_count = post_aggregates_list.iter().find(|p| p.post_id == existing_post.id).unwrap().comments;
+                            Some(existing_post_id) => {
+                                let post_comment_count = post_aggregates_list.get(existing_post_id).unwrap();
 
                                 let loaded_post_comments = post.count_recursive();
-                                if loaded_post_comments == post_comment_count as usize {
+                                if loaded_post_comments == *post_comment_count as usize {
                                     if !import_options.only_progress {
                                         info!("Skipping duplicate post {} with {} comments", post.title.clone(), post.comments.len());                                        
                                     }
