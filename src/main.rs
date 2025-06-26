@@ -5,6 +5,7 @@ use std::{
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use bcrypt::{DEFAULT_COST, hash};
@@ -13,13 +14,14 @@ use diesel::insert_into;
 use diesel_async::RunQueryDsl;
 use futures::{StreamExt, stream};
 use gumdrop::Options;
+use indicatif::ProgressBar;
 use lemmy_db_views::structs::SiteView;
 use log::{LevelFilter, debug, error, info};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
 use lemmy_db_schema::{
-    aggregates::structs::PostAggregates,
+    aggregates::structs::{CommunityAggregates, PostAggregates},
     newtypes::CommentId,
     schema::{
         comment_like, person, post,
@@ -27,7 +29,7 @@ use lemmy_db_schema::{
     },
     source::{
         comment::{Comment, CommentInsertForm, CommentLikeForm},
-        community::Community,
+        community::{self, Community},
         local_user::{LocalUser, LocalUserInsertForm},
         person::{Person, PersonInsertForm},
         post::{Post, PostInsertForm, PostLikeForm},
@@ -70,6 +72,9 @@ struct ImportOptions {
 
     #[options(help = "load user list per post inserted")]
     load_users_every_post: bool,
+
+    #[options(help = "only print progress bar")]
+    only_progress: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,23 +176,37 @@ async fn main() {
 
         let concurrency_limit = 15;
 
-        let entries = WalkDir::new(path)
+        let entries: Vec<_> = WalkDir::new(path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
-            .map(|e| e.into_path());
+            .map(|e| e.into_path())
+            .collect();
+
+        let pb = ProgressBar::new(entries.len() as u64);
 
         let mut initial_conn = get_conn(&mut db_pool).await.unwrap();
 
+        // TODO: load to HashMap?
+
+        info!("Loading users from db...");
         let voting_users = person::table
             .load::<Person>(&mut initial_conn)
             .await
             .unwrap();
 
+        info!("Loading existing posts from db...");
         let post_list = post::table.load::<Post>(&mut initial_conn).await.unwrap();
 
+        info!("Loading post metadata from db...");
         let post_aggregates_list = lemmy_db_schema::schema::post_aggregates::table
             .load::<PostAggregates>(&mut initial_conn)
+            .await
+            .unwrap();
+
+        info!("Loading communities from db...");
+        let community_list = lemmy_db_schema::schema::community::table
+            .load::<Community>(&mut initial_conn)
             .await
             .unwrap();
 
@@ -199,7 +218,9 @@ async fn main() {
             let new_user_password_hash = new_user_password_hash.clone();
             let mut voting_users = voting_users.clone();
             let post_list = post_list.clone();
+            let community_list = community_list.clone();
             let post_aggregates_list = post_aggregates_list.clone();
+            let pb = pb.clone();
 
             async move {
             let mut db_pool = DbPool::Pool(&owned_pool);
@@ -228,16 +249,9 @@ async fn main() {
                 let community_name = format!("{community_name}Mirror");
                 debug!("community_name: {community_name}");
 
-                match Community::read_from_name(&mut db_pool, &community_name, false).await {
-                    Ok(community_id) => {
-                        let user_id = get_or_create_user(
-                            &post.author,
-                            &site_view,
-                            &mut db_pool,
-                            &new_user_password_hash,
-                        )
-                        .await
-                        .id;
+                match community_list.iter().find(|p| p.name == community_name) {
+                    Some(community) => {
+                        let community_id = community.id;
 
                         let title_trunc: String = post.title.chars().take(200).collect();
 
@@ -250,10 +264,14 @@ async fn main() {
 
                                 let loaded_post_comments = post.count_recursive();
                                 if loaded_post_comments == post_comment_count as usize {
-                                    info!("Skipping duplicate post {} with {} comments", post.title.clone(), post.comments.len());
+                                    if !import_options.only_progress {
+                                        info!("Skipping duplicate post {} with {} comments", post.title.clone(), post.comments.len());                                        
+                                    }
                                     true
                                 } else {
-                                    info!("Updating post {} ({} -> {} comments)", post.title.clone(), post_comment_count, loaded_post_comments);
+                                    if !import_options.only_progress {
+                                        info!("Updating post {} ({} -> {} comments)", post.title.clone(), post_comment_count, loaded_post_comments);
+                                    }
                                     false
                                 }
                             }
@@ -263,7 +281,18 @@ async fn main() {
                         };
 
                         if !skip_dupe && !import_options.gen_users_only {
-                            info!("Inserting post {} into DB", post.title);
+                            let user_id = get_or_create_user(
+                                &post.author,
+                                &site_view,
+                                &mut db_pool,
+                                &new_user_password_hash,
+                            )
+                            .await
+                            .id;
+                        
+                            if !import_options.only_progress {
+                                info!("Inserting post {} into DB", post.title);
+                            }
 
                             let publish_date = Utc
                                 .timestamp_opt(post.created_utc.trunc() as i64, 0)
@@ -279,7 +308,7 @@ async fn main() {
                             let lemmy_post = PostInsertForm::builder()
                                 .name(title_trunc)
                                 .creator_id(user_id)
-                                .community_id(community_id.unwrap().id)
+                                .community_id(community_id)
                                 .nsfw(Some(nsfw))
                                 .body(Some(post.selftext))
                                 .published(Some(publish_date))
@@ -351,10 +380,12 @@ async fn main() {
                                     "Inserting comment with Comment ID: {}, Parent ID: {:?}, Body: {}",
                                     comment.id, parent_id, comment.body
                                 );
-                                info!(
-                                    "Inserting comment with score {} by '{}'",
-                                    comment.score, comment.author
-                                );
+                                if !import_options.only_progress {
+                                    info!(
+                                        "Inserting comment with score {} by '{}'",
+                                        comment.score, comment.author
+                                    );
+                                }
 
                                 let author_id = get_or_create_user(
                                     &comment.author,
@@ -476,15 +507,18 @@ async fn main() {
                             }
                         }
                     }
-                    Err(e) => {
-                        error!("Lemmy community doesn't exist: {e}")
+                    None => {
+                        error!("Lemmy community doesn't exist: {community_name}")
                     }}
                 }
+                pb.inc(1);
             }
         })
         .buffer_unordered(concurrency_limit)
         .collect::<Vec<_>>() // Collect to drive the stream to completion
         .await;
+
+        pb.finish();
     }
 }
 
