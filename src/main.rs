@@ -1,6 +1,5 @@
 use std::{
     // TODO: Paralellize, reduce uneeded DB reads, batch writes
-    cmp,
     collections::HashMap,
     env,
     fs::File,
@@ -10,7 +9,7 @@ use std::{
 
 use bcrypt::{DEFAULT_COST, hash};
 use chrono::{TimeZone, Utc};
-use diesel::{OptionalExtension, QueryDsl, expression_methods::ExpressionMethods, insert_into};
+use diesel::insert_into;
 use diesel_async::RunQueryDsl;
 use futures::{StreamExt, stream};
 use gumdrop::Options;
@@ -20,7 +19,7 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use lemmy_db_schema::{
-    aggregates::{post_aggregates, structs::PostAggregates},
+    aggregates::structs::PostAggregates,
     newtypes::CommentId,
     schema::{
         comment_like, person, post,
@@ -68,6 +67,9 @@ struct ImportOptions {
 
     #[options(help = "force all posts to be not marked nsfw")]
     dont_mark_nsfw: bool,
+
+    #[options(help = "load user list per post inserted")]
+    load_users_every_post: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,10 +177,29 @@ async fn main() {
             .filter(|e| e.file_type().is_file())
             .map(|e| e.into_path());
 
+        let mut initial_conn = get_conn(&mut db_pool).await.unwrap();
+
+        let voting_users = person::table
+            .load::<Person>(&mut initial_conn)
+            .await
+            .unwrap();
+
+        let post_list = post::table.load::<Post>(&mut initial_conn).await.unwrap();
+
+        let post_aggregates_list = lemmy_db_schema::schema::post_aggregates::table
+            .load::<PostAggregates>(&mut initial_conn)
+            .await
+            .unwrap();
+
+        drop(initial_conn);
+
         stream::iter(entries).map(|path: PathBuf|{
             let owned_pool = actual_pool.clone();
             let site_view = site_view.clone();
             let new_user_password_hash = new_user_password_hash.clone();
+            let mut voting_users = voting_users.clone();
+            let post_list = post_list.clone();
+            let post_aggregates_list = post_aggregates_list.clone();
 
             async move {
             let mut db_pool = DbPool::Pool(&owned_pool);
@@ -220,16 +241,12 @@ async fn main() {
 
                         let title_trunc: String = post.title.chars().take(200).collect();
 
-                        let skip_dupe = match post::table
-                            .filter(post::name.eq(title_trunc.clone()))
-                            .filter(post::body.eq(post.selftext.clone()))
-                            .first::<Post>(&mut conn)
-                            .await
-                            .optional()
-                            .unwrap()
+                        let skip_dupe = match post_list
+                        .iter()
+                        .find(|p| p.name == title_trunc && p.body == Some(post.selftext.clone()))
                         {
                             Some(existing_post) => {
-                                let post_comment_count = PostAggregates::read(&mut db_pool, existing_post.id).await.unwrap().unwrap().comments;
+                                let post_comment_count = post_aggregates_list.iter().find(|p| p.post_id == existing_post.id).unwrap().comments;
 
                                 let loaded_post_comments = post.count_recursive();
                                 if loaded_post_comments == post_comment_count as usize {
@@ -268,9 +285,12 @@ async fn main() {
                                 .published(Some(publish_date))
                                 .build();
 
-                            // In order to properly federate, each vote must come from an user. So we use all the users we have to vote, and then generate lots of dummys for the remaining votes.
-                            let mut voting_users =
-                                person::table.load::<Person>(&mut conn).await.unwrap();
+                            if import_options.load_users_every_post {
+                                voting_users = person::table
+                                    .load::<Person>(&mut conn)
+                                    .await
+                                    .unwrap();
+                            }
 
                             for _ in 0..post.score.saturating_sub(voting_users.len().try_into().unwrap()) {
                                 let rand_string: String = rand::rng()
