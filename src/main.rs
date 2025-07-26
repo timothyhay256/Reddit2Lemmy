@@ -3,14 +3,19 @@ use std::{
     collections::HashMap,
     env,
     path::{Path, PathBuf},
-    sync::Arc, time::Instant,
+    sync::Arc,
+    time::Instant,
 };
 use tokio::io::AsyncReadExt;
 
 use bcrypt::{DEFAULT_COST, hash};
 use chrono::{TimeZone, Utc};
-use diesel::{insert_into, ExpressionMethods};
-use diesel_async::RunQueryDsl;
+use diesel::query_dsl::methods::FilterDsl;
+use diesel::{ExpressionMethods, insert_into};
+use diesel_async::{
+    AsyncPgConnection, RunQueryDsl,
+    pooled_connection::{AsyncDieselConnectionManager, deadpool::Pool},
+};
 use futures::{StreamExt, stream};
 use gumdrop::Options;
 use indicatif::ProgressBar;
@@ -19,7 +24,6 @@ use log::{LevelFilter, debug, error, info};
 use serde::Deserialize;
 use tokio::fs::File;
 use walkdir::WalkDir;
-use diesel::query_dsl::methods::FilterDsl;
 
 use lemmy_db_schema::source::post::PostUpdateForm;
 use lemmy_db_schema::{
@@ -37,7 +41,7 @@ use lemmy_db_schema::{
         post::{Post, PostInsertForm, PostLikeForm},
     },
     traits::{ApubActor, Crud},
-    utils::{build_db_pool, get_conn, DbPool},
+    utils::{DbPool, build_db_pool, get_conn},
 };
 use rand::{Rng, distr::Alphanumeric};
 
@@ -77,6 +81,9 @@ struct ImportOptions {
 
     #[options(help = "only print progress bar")]
     only_progress: bool,
+
+    #[options(help = "don't spawn tasks for imports")]
+    no_tasks: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,7 +192,6 @@ async fn main() {
             .map(|e| e.into_path())
             .collect();
 
-            
         let pb = ProgressBar::new(entries.len() as u64);
 
         let mut initial_conn = get_conn(&mut db_pool).await.unwrap();
@@ -201,7 +207,10 @@ async fn main() {
         info!("Loading existing posts from db...");
         let post_list_vec = post::table.load::<Post>(&mut initial_conn).await.unwrap();
 
-        let post_list: HashMap<(String, String), PostId> = post_list_vec.into_iter().map(|p| ((p.name, p.body.unwrap()), p.id)).collect();
+        let post_list: HashMap<(String, String), PostId> = post_list_vec
+            .into_iter()
+            .map(|p| ((p.name, p.body.unwrap()), p.id))
+            .collect();
 
         info!("Loading post metadata from db...");
         let post_aggregates_list_vec = lemmy_db_schema::schema::post_aggregates::table
@@ -209,7 +218,10 @@ async fn main() {
             .await
             .unwrap();
 
-        let post_aggregates_list: HashMap<PostId, i64> = post_aggregates_list_vec.into_iter().map(|pa| (pa.post_id, pa.comments)).collect();
+        let post_aggregates_list: HashMap<PostId, i64> = post_aggregates_list_vec
+            .into_iter()
+            .map(|pa| (pa.post_id, pa.comments))
+            .collect();
 
         info!("Loading communities from db..."); // Don't put in HashMap since it's likely very short list
         let community_list = lemmy_db_schema::schema::community::table
@@ -219,7 +231,40 @@ async fn main() {
 
         drop(initial_conn);
 
-        stream::iter(entries).map(|path: PathBuf|{
+        if !import_options.no_tasks {
+            stream::iter(entries)
+                .map(|path: PathBuf| {
+                    let owned_pool = actual_pool.clone();
+                    let site_view = site_view.clone();
+                    let new_user_password_hash = new_user_password_hash.clone();
+                    let mut voting_users = voting_users.clone();
+                    let post_list = post_list.clone();
+                    let community_list = community_list.clone();
+                    let post_aggregates_list = post_aggregates_list.clone();
+                    let pb = pb.clone();
+
+                    async move {
+                        process_post(
+                            &path,
+                            &community_list,
+                            &post_list,
+                            &post_aggregates_list,
+                            import_options,
+                            Some(&owned_pool),
+                            &site_view,
+                            &new_user_password_hash,
+                            &mut voting_users,
+                            &pb,
+                        )
+                        .await;
+                    }
+                })
+                .buffer_unordered(concurrency_limit)
+                .collect::<Vec<_>>() // Collect to drive the stream to completion
+                .await;
+
+            pb.finish();
+        } else {
             let owned_pool = actual_pool.clone();
             let site_view = site_view.clone();
             let new_user_password_hash = new_user_password_hash.clone();
@@ -229,315 +274,22 @@ async fn main() {
             let post_aggregates_list = post_aggregates_list.clone();
             let pb = pb.clone();
 
-            async move {
-            let mut db_pool = DbPool::Pool(&owned_pool);
-
-            let mut db_pool_for_conn = DbPool::Pool(&owned_pool);
-            let mut conn = get_conn(&mut db_pool_for_conn).await.unwrap();
-
-            if path.is_file() {
-                let mut file = File::open(&path).await.expect("Failed to open file");
-                let mut contents = Vec::new();
-                file.read_to_end(&mut contents).await.expect("Failed to read file");
-                
-                let post: RedditPost = serde_json::from_slice(&contents).expect("Unable to parse post");
-                
-                let community_name = post
-                    .permalink
-                    .strip_prefix("/r/")
-                    .and_then(|s| s.split('/').next())
-                    .unwrap_or("");
-
-                let community_name = format!("{community_name}Mirror");
-                debug!("community_name: {community_name}");
-
-                match community_list.iter().find(|p| p.name == community_name) {
-                    Some(community) => {
-                        let community_id = community.id;
-
-                        let title_trunc: String = post.title.chars().take(200).collect();
-
-                        let (post_id, skip_dupe) = match post_list.get(&(title_trunc.clone(), post.selftext.clone()))
-                        {
-                            Some(existing_post_id) => {
-                                let post_comment_count = post_aggregates_list.get(existing_post_id).unwrap();
-
-                                let loaded_post_comments = post.count_recursive();
-                                if loaded_post_comments == *post_comment_count as usize {
-                                    if !import_options.only_progress {
-                                        info!("Skipping duplicate post {} with {} comments", post.title.clone(), post.comments.len());                                        
-                                    }
-                                    (Some(existing_post_id), true)
-                                } else {
-                                    if !import_options.only_progress {
-                                        info!("Updating post {} ({} -> {} comments)", post.title.clone(), post_comment_count, loaded_post_comments);
-                                    }
-                                    (Some(existing_post_id), false)
-                                }
-                            }
-                            None => {
-                                (None, false)
-                            }
-                        };
-
-                        if !skip_dupe && !import_options.gen_users_only {
-                            let user_id = get_or_create_user(
-                                &post.author,
-                                &site_view,
-                                &mut db_pool,
-                                &new_user_password_hash,
-                            )
-                            .await
-                            .id;
-                        
-                            if !import_options.only_progress {
-                                info!("Inserting post {} into DB", post.title);
-                            }
-
-                            let publish_date = Utc
-                                .timestamp_opt(post.created_utc.trunc() as i64, 0)
-                                .unwrap();
-
-                            let nsfw = {
-                                if import_options.dont_mark_nsfw {
-                                    false
-                                } else {
-                                    post.over_18
-                                }
-                            };
-                            let lemmy_post = PostInsertForm::builder()
-                                .name(title_trunc)
-                                .creator_id(user_id)
-                                .community_id(community_id)
-                                .nsfw(Some(nsfw))
-                                .body(Some(post.selftext))
-                                .published(Some(publish_date))
-                                .build();
-
-                            if import_options.load_users_every_post {
-                                voting_users = person::table
-                                    .load::<Person>(&mut conn)
-                                    .await
-                                    .unwrap();
-                            }
-
-                            // TODO: Don't remove entire post just to reinsert it
-
-                            if let Some(post_id) = post_id {
-                                info!("Updating existing post {}", post.title);
-                                
-                                Post::update(
-                                    &mut db_pool,
-                                    *post_id,
-                                    &PostUpdateForm {
-                                        deleted: Some(true),
-                                        ..Default::default()
-                                    },
-                                ).await.unwrap();
-                            }
-
-                            let lemmy_post_id = Post::create(&mut db_pool, &lemmy_post).await.unwrap().id;
-
-                            for _ in 0..post.score.saturating_sub(voting_users.len().try_into().unwrap()) {
-                                let rand_string: String = rand::rng()
-                                .sample_iter(&Alphanumeric)
-                                .take(7)
-                                .map(char::from)
-                                .collect();
-
-                                let username = format!("voteuser-{rand_string}");
-                                debug!("Adding {username} as a voteuser");
-
-                                let user = get_or_create_user(
-                                    &username,
-                                    &site_view,
-                                    &mut db_pool,
-                                    &new_user_password_hash,
-                                ).await;
-
-                                voting_users.push(user);
-                            }
-
-                            let mut voting_users_trunc = voting_users.clone();
-
-                            voting_users_trunc.truncate(post.score.try_into().unwrap()); // Now we can just iterate through voting_users_trunc
-
-                            let score_value = if post.score > 0 { 1 } else { -1 };
-
-                            let like_forms: Vec<_> = voting_users_trunc
-                                .iter()
-                                .map(|user| PostLikeForm {
-                                    post_id: lemmy_post_id,
-                                    person_id: user.id,
-                                    score: score_value,
-                                })
-                                .collect();
-
-                            insert_into(post_like::table)
-                                .values(&like_forms)
-                                .execute(&mut conn)
-                                .await
-                                .unwrap();
-
-                            // Insert comments
-
-                            let mut flat_comments = Vec::new();
-                            walk_comments(None, &post.comments, &mut flat_comments);
-
-                            let mut reddit_lemmy_id: HashMap<String, CommentId> =
-                                HashMap::new();
-                            // Since walking the path will always insert parent comments first, we can insert the comment Reddit id and Lemmy id
-                            // allowing us to use the reddit coment parent id to determine the correct parent to set a reply to.
-
-                            for (parent_id, comment) in flat_comments {
-                                debug!(
-                                    "Inserting comment with Comment ID: {}, Parent ID: {:?}, Body: {}",
-                                    comment.id, parent_id, comment.body
-                                );
-                                if !import_options.only_progress {
-                                    info!(
-                                        "Inserting comment with score {} by '{}' on post '{}'",
-                                        comment.score, comment.author, post.title
-                                    );
-                                }
-
-                                let author_id = get_or_create_user(
-                                    &comment.author,
-                                    &site_view,
-                                    &mut db_pool,
-                                    &new_user_password_hash,
-                                )
-                                .await
-                                .id;
-
-                                let publish_date = Utc
-                                    .timestamp_opt(comment.created_utc.trunc() as i64, 0)
-                                    .unwrap();
-
-                                let lemmy_comment = CommentInsertForm::builder()
-                                    .creator_id(author_id)
-                                    .post_id(lemmy_post_id)
-                                    .content(comment.body.clone())
-                                    .published(Some(publish_date))
-                                    .build();
-
-                                let new_lemmy_comment_id = {
-                                    if parent_id.is_none() {
-                                        let new_lemmy_comment_id = Comment::create(
-                                            &mut db_pool,
-                                            &lemmy_comment,
-                                            None,
-                                        )
-                                        .await
-                                        .unwrap()
-                                        .id;
-
-                                        reddit_lemmy_id.insert(
-                                            comment.id.clone(),
-                                            new_lemmy_comment_id,
-                                        );
-
-                                        new_lemmy_comment_id
-                                    } else {
-                                        let lemmy_parent_id = reddit_lemmy_id
-                                            .get(parent_id.unwrap())
-                                            .unwrap(); // Unwrap since walk_comments should always run in order
-
-                                        let parent_comment_path =
-                                            Comment::read(&mut db_pool, *lemmy_parent_id)
-                                                .await
-                                                .unwrap()
-                                                .unwrap()
-                                                .path;
-
-                                        let new_lemmy_comment_id = Comment::create(
-                                            &mut db_pool,
-                                            &lemmy_comment,
-                                            Some(&parent_comment_path),
-                                        )
-                                        .await
-                                        .unwrap()
-                                        .id;
-
-                                        reddit_lemmy_id.insert(
-                                            comment.id.clone(),
-                                            new_lemmy_comment_id,
-                                        );
-
-                                        new_lemmy_comment_id
-                                    }
-                                };
-
-                                // Apply score to comment
-                                // TODO: Make a function, reduce uneeded DB requests, just clean up in general
-
-                                let score = comment.score;
-                                let vote_count = score.unsigned_abs() as usize;
-
-                                for _ in 0..vote_count.saturating_sub(voting_users.len()) {
-                                    let rand_string: String = rand::rng()
-                                    .sample_iter(&Alphanumeric)
-                                    .take(7)
-                                    .map(char::from)
-                                    .collect();
-
-                                    let username = format!("voteuser-{rand_string}");
-                                    debug!("Adding {username} as a voteuser");
-
-                                    let user = get_or_create_user(
-                                        &username,
-                                        &site_view,
-                                        &mut db_pool,
-                                        &new_user_password_hash,
-                                    ).await;
-
-                                    voting_users.push(user);
-                                }
-
-                                let mut voting_users_trunc = voting_users.clone();
-                                voting_users_trunc.truncate(vote_count);
-                                
-
-                                // Determine the score each vote should get
-                                let score_value = if score > 0 { 1 } else { -1 };
-
-                                let like_forms: Vec<_> = voting_users_trunc
-                                    .iter()
-                                    .map(|user| CommentLikeForm {
-                                        comment_id: new_lemmy_comment_id,
-                                        post_id: lemmy_post_id,
-                                        person_id: user.id,
-                                        score: score_value,
-                                    })
-                                    .collect();
-
-                                match insert_into(comment_like::table)
-                                    .values(&like_forms)
-                                    .execute(&mut conn)
-                                    .await {
-                                        Ok(_) => {},
-                                        Err(e) => {error!("Failed to insert comment_likes with:\nvoting_users_trunc: {:?}\n error: {e}", voting_users_trunc)}
-                                    }
-
-                                reddit_lemmy_id.insert(comment.id.clone(), new_lemmy_comment_id);
-
-                            }
-                        }
-                    }
-                    None => {
-                        error!("Lemmy community doesn't exist: {community_name}")
-                    }}
-                }
-                if !import_options.only_progress {
-                    pb.inc(1);
-                }
+            for entry in entries {
+                process_post(
+                    &entry,
+                    &community_list,
+                    &post_list,
+                    &post_aggregates_list,
+                    import_options,
+                    Some(&owned_pool),
+                    &site_view,
+                    &new_user_password_hash,
+                    &mut voting_users,
+                    &pb,
+                )
+                .await;
             }
-        })
-        .buffer_unordered(concurrency_limit)
-        .collect::<Vec<_>>() // Collect to drive the stream to completion
-        .await;
-
-        pb.finish();
+        }
     }
 }
 
@@ -589,5 +341,334 @@ fn walk_comments<'a>(
     for comment in comments {
         out.push((parent_id, comment));
         walk_comments(Some(&comment.id), &comment.replies, out);
+    }
+}
+
+async fn process_post(
+    path: &std::path::Path,
+    community_list: &[Community],
+    post_list: &HashMap<(String, String), PostId>,
+    post_aggregates_list: &HashMap<PostId, i64>,
+    import_options: &ImportOptions,
+    owned_pool: Option<&Pool<AsyncPgConnection>>,
+    site_view: &SiteView,
+    new_user_password_hash: &str,
+    mut voting_users: &mut Vec<Person>,
+    pb: &ProgressBar,
+) {
+    if path.is_file() {
+        let mut file = File::open(&path).await.expect("Failed to open file");
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .await
+            .expect("Failed to read file");
+
+        let post: RedditPost = serde_json::from_slice(&contents).expect("Unable to parse post");
+
+        let community_name = post
+            .permalink
+            .strip_prefix("/r/")
+            .and_then(|s| s.split('/').next())
+            .unwrap_or("");
+
+        let community_name = format!("{community_name}Mirror");
+        debug!("community_name: {community_name}");
+
+        match community_list.iter().find(|p| p.name == community_name) {
+            Some(community) => {
+                let community_id = community.id;
+
+                let title_trunc: String = post.title.chars().take(200).collect();
+
+                let (post_id, skip_dupe) =
+                    match post_list.get(&(title_trunc.clone(), post.selftext.clone())) {
+                        Some(existing_post_id) => {
+                            let post_comment_count =
+                                post_aggregates_list.get(existing_post_id).unwrap();
+
+                            let loaded_post_comments = post.count_recursive();
+                            if loaded_post_comments == *post_comment_count as usize {
+                                if !import_options.only_progress {
+                                    info!(
+                                        "Skipping duplicate post {} with {} comments",
+                                        post.title.clone(),
+                                        post.comments.len()
+                                    );
+                                }
+                                (Some(existing_post_id), true)
+                            } else {
+                                if !import_options.only_progress {
+                                    info!(
+                                        "Updating post {} ({} -> {} comments)",
+                                        post.title.clone(),
+                                        post_comment_count,
+                                        loaded_post_comments
+                                    );
+                                }
+                                (Some(existing_post_id), false)
+                            }
+                        }
+                        None => (None, false),
+                    };
+
+                if !skip_dupe && !import_options.gen_users_only {
+                    let owned_pool = owned_pool.unwrap();
+
+                    let mut db_pool = DbPool::Pool(&owned_pool);
+
+                    let mut db_pool_for_conn = DbPool::Pool(&owned_pool);
+                    let mut conn = get_conn(&mut db_pool_for_conn).await.unwrap();
+
+                    let user_id = get_or_create_user(
+                        &post.author,
+                        &site_view,
+                        &mut db_pool,
+                        &new_user_password_hash,
+                    )
+                    .await
+                    .id;
+
+                    if !import_options.only_progress {
+                        info!("Inserting post {} into DB", post.title);
+                    }
+
+                    let publish_date = Utc
+                        .timestamp_opt(post.created_utc.trunc() as i64, 0)
+                        .unwrap();
+
+                    let nsfw = {
+                        if import_options.dont_mark_nsfw {
+                            false
+                        } else {
+                            post.over_18
+                        }
+                    };
+                    let lemmy_post = PostInsertForm::builder()
+                        .name(title_trunc)
+                        .creator_id(user_id)
+                        .community_id(community_id)
+                        .nsfw(Some(nsfw))
+                        .body(Some(post.selftext))
+                        .published(Some(publish_date))
+                        .build();
+
+                    let voting_users = {
+                        if import_options.load_users_every_post {
+                            &mut person::table.load::<Person>(&mut conn).await.unwrap()
+                        } else {
+                            voting_users
+                        }
+                    };
+
+                    // TODO: Don't remove entire post just to reinsert it
+
+                    if let Some(post_id) = post_id {
+                        info!("Updating existing post {}", post.title);
+
+                        Post::update(
+                            &mut db_pool,
+                            *post_id,
+                            &PostUpdateForm {
+                                deleted: Some(true),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+
+                    let lemmy_post_id = Post::create(&mut db_pool, &lemmy_post).await.unwrap().id;
+
+                    for _ in 0..post
+                        .score
+                        .saturating_sub(voting_users.len().try_into().unwrap())
+                    {
+                        let rand_string: String = rand::thread_rng()
+                            .sample_iter(&Alphanumeric)
+                            .take(7)
+                            .map(char::from)
+                            .collect();
+
+                        let username = format!("voteuser-{rand_string}");
+                        debug!("Adding {username} as a voteuser");
+
+                        let user = get_or_create_user(
+                            &username,
+                            &site_view,
+                            &mut db_pool,
+                            &new_user_password_hash,
+                        )
+                        .await;
+
+                        voting_users.push(user);
+                    }
+
+                    let mut voting_users_trunc = voting_users.clone();
+
+                    voting_users_trunc.truncate(post.score.try_into().unwrap()); // Now we can just iterate through voting_users_trunc
+
+                    let score_value = if post.score > 0 { 1 } else { -1 };
+
+                    let like_forms: Vec<_> = voting_users_trunc
+                        .iter()
+                        .map(|user| PostLikeForm {
+                            post_id: lemmy_post_id,
+                            person_id: user.id,
+                            score: score_value,
+                        })
+                        .collect();
+
+                    insert_into(post_like::table)
+                        .values(&like_forms)
+                        .execute(&mut conn)
+                        .await
+                        .unwrap();
+
+                    // Insert comments
+
+                    let mut flat_comments = Vec::new();
+                    walk_comments(None, &post.comments, &mut flat_comments);
+
+                    let mut reddit_lemmy_id: HashMap<String, CommentId> = HashMap::new();
+                    // Since walking the path will always insert parent comments first, we can insert the comment Reddit id and Lemmy id
+                    // allowing us to use the reddit coment parent id to determine the correct parent to set a reply to.
+
+                    for (parent_id, comment) in flat_comments {
+                        debug!(
+                            "Inserting comment with Comment ID: {}, Parent ID: {:?}, Body: {}",
+                            comment.id, parent_id, comment.body
+                        );
+                        if !import_options.only_progress {
+                            info!(
+                                "Inserting comment with score {} by '{}' on post '{}'",
+                                comment.score, comment.author, post.title
+                            );
+                        }
+
+                        let author_id = get_or_create_user(
+                            &comment.author,
+                            &site_view,
+                            &mut db_pool,
+                            &new_user_password_hash,
+                        )
+                        .await
+                        .id;
+
+                        let publish_date = Utc
+                            .timestamp_opt(comment.created_utc.trunc() as i64, 0)
+                            .unwrap();
+
+                        let lemmy_comment = CommentInsertForm::builder()
+                            .creator_id(author_id)
+                            .post_id(lemmy_post_id)
+                            .content(comment.body.clone())
+                            .published(Some(publish_date))
+                            .build();
+
+                        let new_lemmy_comment_id = {
+                            if parent_id.is_none() {
+                                let new_lemmy_comment_id =
+                                    Comment::create(&mut db_pool, &lemmy_comment, None)
+                                        .await
+                                        .unwrap()
+                                        .id;
+
+                                reddit_lemmy_id.insert(comment.id.clone(), new_lemmy_comment_id);
+
+                                new_lemmy_comment_id
+                            } else {
+                                let lemmy_parent_id =
+                                    reddit_lemmy_id.get(parent_id.unwrap()).unwrap(); // Unwrap since walk_comments should always run in order
+
+                                let parent_comment_path =
+                                    Comment::read(&mut db_pool, *lemmy_parent_id)
+                                        .await
+                                        .unwrap()
+                                        .unwrap()
+                                        .path;
+
+                                let new_lemmy_comment_id = Comment::create(
+                                    &mut db_pool,
+                                    &lemmy_comment,
+                                    Some(&parent_comment_path),
+                                )
+                                .await
+                                .unwrap()
+                                .id;
+
+                                reddit_lemmy_id.insert(comment.id.clone(), new_lemmy_comment_id);
+
+                                new_lemmy_comment_id
+                            }
+                        };
+
+                        // Apply score to comment
+                        // TODO: Make a function, reduce uneeded DB requests, just clean up in general
+
+                        let score = comment.score;
+                        let vote_count = score.unsigned_abs() as usize;
+
+                        for _ in 0..vote_count.saturating_sub(voting_users.len()) {
+                            let rand_string: String = rand::thread_rng()
+                                .sample_iter(&Alphanumeric)
+                                .take(7)
+                                .map(char::from)
+                                .collect();
+
+                            let username = format!("voteuser-{rand_string}");
+                            debug!("Adding {username} as a voteuser");
+
+                            let user = get_or_create_user(
+                                &username,
+                                &site_view,
+                                &mut db_pool,
+                                &new_user_password_hash,
+                            )
+                            .await;
+
+                            voting_users.push(user);
+                        }
+
+                        let mut voting_users_trunc = voting_users.clone();
+                        voting_users_trunc.truncate(vote_count);
+
+                        // Determine the score each vote should get
+                        let score_value = if score > 0 { 1 } else { -1 };
+
+                        let like_forms: Vec<_> = voting_users_trunc
+                            .iter()
+                            .map(|user| CommentLikeForm {
+                                comment_id: new_lemmy_comment_id,
+                                post_id: lemmy_post_id,
+                                person_id: user.id,
+                                score: score_value,
+                            })
+                            .collect();
+
+                        match insert_into(comment_like::table)
+                            .values(&like_forms)
+                            .execute(&mut conn)
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                error!(
+                                    "Failed to insert comment_likes with:\nvoting_users_trunc: {:?}\n error: {e}",
+                                    voting_users_trunc
+                                )
+                            }
+                        }
+
+                        reddit_lemmy_id.insert(comment.id.clone(), new_lemmy_comment_id);
+                    }
+                }
+            }
+            None => {
+                error!("Lemmy community doesn't exist: {community_name}")
+            }
+        }
+    }
+    if !import_options.only_progress {
+        pb.inc(1);
     }
 }
