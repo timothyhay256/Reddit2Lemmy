@@ -84,6 +84,9 @@ struct ImportOptions {
 
     #[options(help = "don't spawn tasks for imports")]
     no_tasks: bool,
+
+    #[options(help = "what to override username with")]
+    username_override: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,12 +297,15 @@ async fn main() {
 }
 
 async fn get_or_create_user(
+    override_username: &Option<String>,
     username: &String,
     site_view: &SiteView,
     db_pool: &mut DbPool<'_>,
     new_user_password_hash: &str,
 ) -> Person {
-    let username = format!("{username}-mirror");
+    let username = override_username
+        .clone()
+        .unwrap_or(format!("{username}-mirror"));
     let username_trunc: String = username.chars().take(20).collect();
 
     match Person::read_from_name(db_pool, &username_trunc, false).await {
@@ -353,7 +359,7 @@ async fn process_post(
     owned_pool: Option<&Pool<AsyncPgConnection>>,
     site_view: &SiteView,
     new_user_password_hash: &str,
-    mut voting_users: &mut Vec<Person>,
+    voting_users: &mut Vec<Person>,
     pb: &ProgressBar,
 ) {
     if path.is_file() {
@@ -414,16 +420,17 @@ async fn process_post(
                 if !skip_dupe && !import_options.gen_users_only {
                     let owned_pool = owned_pool.unwrap();
 
-                    let mut db_pool = DbPool::Pool(&owned_pool);
+                    let mut db_pool = DbPool::Pool(owned_pool);
 
-                    let mut db_pool_for_conn = DbPool::Pool(&owned_pool);
+                    let mut db_pool_for_conn = DbPool::Pool(owned_pool);
                     let mut conn = get_conn(&mut db_pool_for_conn).await.unwrap();
 
                     let user_id = get_or_create_user(
+                        &import_options.username_override,
                         &post.author,
-                        &site_view,
+                        site_view,
                         &mut db_pool,
-                        &new_user_password_hash,
+                        new_user_password_hash,
                     )
                     .await
                     .id;
@@ -483,7 +490,7 @@ async fn process_post(
                         .score
                         .saturating_sub(voting_users.len().try_into().unwrap())
                     {
-                        let rand_string: String = rand::thread_rng()
+                        let rand_string: String = rand::rng()
                             .sample_iter(&Alphanumeric)
                             .take(7)
                             .map(char::from)
@@ -493,10 +500,11 @@ async fn process_post(
                         debug!("Adding {username} as a voteuser");
 
                         let user = get_or_create_user(
+                            &import_options.username_override,
                             &username,
-                            &site_view,
+                            site_view,
                             &mut db_pool,
-                            &new_user_password_hash,
+                            new_user_password_hash,
                         )
                         .await;
 
@@ -546,6 +554,7 @@ async fn process_post(
                         }
 
                         let author_id = get_or_create_user(
+                            &import_options.username_override,
                             &comment.author,
                             &site_view,
                             &mut db_pool,
@@ -619,6 +628,7 @@ async fn process_post(
                             debug!("Adding {username} as a voteuser");
 
                             let user = get_or_create_user(
+                                &import_options.username_override,
                                 &username,
                                 &site_view,
                                 &mut db_pool,
