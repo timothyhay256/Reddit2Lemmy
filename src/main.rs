@@ -425,8 +425,19 @@ async fn process_post(
                     let mut db_pool_for_conn = DbPool::Pool(owned_pool);
                     let mut conn = get_conn(&mut db_pool_for_conn).await.unwrap();
 
+                    let new_username = Some(format!(
+                        "{} Post OP",
+                        &import_options.username_override.clone().unwrap()
+                    )); // this code sucks
+
                     let user_id = get_or_create_user(
-                        &import_options.username_override,
+                        {
+                            if import_options.username_override.is_some() {
+                                &new_username
+                            } else {
+                                &import_options.username_override
+                            }
+                        },
                         &post.author,
                         site_view,
                         &mut db_pool,
@@ -555,7 +566,13 @@ async fn process_post(
                         }
 
                         let author_id = get_or_create_user(
-                            &import_options.username_override,
+                            {
+                                if post.author == comment.author {
+                                    &new_username
+                                } else {
+                                    &import_options.username_override
+                                }
+                            },
                             &comment.author,
                             site_view,
                             &mut db_pool,
