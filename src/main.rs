@@ -423,6 +423,8 @@ async fn process_post(
                 let skip_dupe = {
                     if import_options.skip_low_score.unwrap_or(false) {
                         if post.score <= 0 { true } else { skip_dupe }
+                    } else if post.selftext == "[removed]" {
+                        true
                     } else {
                         skip_dupe
                     }
