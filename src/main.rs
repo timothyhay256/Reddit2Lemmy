@@ -500,7 +500,7 @@ async fn process_post(
                         debug!("Adding {username} as a voteuser");
 
                         let user = get_or_create_user(
-                            &import_options.username_override,
+                            &None,
                             &username,
                             site_view,
                             &mut db_pool,
