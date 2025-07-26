@@ -546,6 +546,7 @@ async fn process_post(
                             "Inserting comment with Comment ID: {}, Parent ID: {:?}, Body: {}",
                             comment.id, parent_id, comment.body
                         );
+
                         if !import_options.only_progress {
                             info!(
                                 "Inserting comment with score {} by '{}' on post '{}'",
@@ -556,9 +557,9 @@ async fn process_post(
                         let author_id = get_or_create_user(
                             &import_options.username_override,
                             &comment.author,
-                            &site_view,
+                            site_view,
                             &mut db_pool,
-                            &new_user_password_hash,
+                            new_user_password_hash,
                         )
                         .await
                         .id;
@@ -628,7 +629,7 @@ async fn process_post(
                             debug!("Adding {username} as a voteuser");
 
                             let user = get_or_create_user(
-                                &import_options.username_override,
+                                &None,
                                 &username,
                                 &site_view,
                                 &mut db_pool,
