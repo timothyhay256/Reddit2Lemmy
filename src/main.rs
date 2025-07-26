@@ -83,7 +83,7 @@ struct ImportOptions {
     only_progress: bool,
 
     #[options(help = "don't spawn tasks for imports")]
-    no_tasks: bool,
+    no_tasks: Option<bool>,
 
     #[options(help = "what to override username with")]
     username_override: Option<String>,
@@ -234,7 +234,7 @@ async fn main() {
 
         drop(initial_conn);
 
-        if !import_options.no_tasks {
+        if !import_options.no_tasks.unwrap_or(false) {
             stream::iter(entries)
                 .map(|path: PathBuf| {
                     let owned_pool = actual_pool.clone();
