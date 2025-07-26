@@ -2,15 +2,14 @@ use std::{
     // TODO: Paralellize, reduce uneeded DB reads, batch writes
     collections::HashMap,
     env,
-    fs::File,
-    io::BufReader,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::Arc, time::Instant,
 };
+use tokio::io::AsyncReadExt;
 
 use bcrypt::{DEFAULT_COST, hash};
 use chrono::{TimeZone, Utc};
-use diesel::insert_into;
+use diesel::{insert_into, ExpressionMethods};
 use diesel_async::RunQueryDsl;
 use futures::{StreamExt, stream};
 use gumdrop::Options;
@@ -18,8 +17,11 @@ use indicatif::ProgressBar;
 use lemmy_db_views::structs::SiteView;
 use log::{LevelFilter, debug, error, info};
 use serde::Deserialize;
+use tokio::fs::File;
 use walkdir::WalkDir;
+use diesel::query_dsl::methods::FilterDsl;
 
+use lemmy_db_schema::source::post::PostUpdateForm;
 use lemmy_db_schema::{
     aggregates::structs::{CommunityAggregates, PostAggregates},
     newtypes::{CommentId, PersonId, PostId},
@@ -28,7 +30,7 @@ use lemmy_db_schema::{
         post_like::{self},
     },
     source::{
-        comment::{Comment, CommentInsertForm, CommentLikeForm},
+        comment::{self, Comment, CommentInsertForm, CommentLikeForm},
         community::{self, Community},
         local_user::{LocalUser, LocalUserInsertForm},
         person::{Person, PersonInsertForm},
@@ -183,6 +185,7 @@ async fn main() {
             .map(|e| e.into_path())
             .collect();
 
+            
         let pb = ProgressBar::new(entries.len() as u64);
 
         let mut initial_conn = get_conn(&mut db_pool).await.unwrap();
@@ -233,17 +236,12 @@ async fn main() {
             let mut conn = get_conn(&mut db_pool_for_conn).await.unwrap();
 
             if path.is_file() {
-
-                let post: RedditPost = tokio::task::spawn_blocking(move || {
-                    let file = File::open(path).unwrap();
-                    let reader = BufReader::new(file);
-                    serde_json::from_reader(reader)
-                })
-                .await
-                .unwrap()
-                .expect("Unable to parse post");
-
-                // Post::create(&mut db_pool, form);
+                let mut file = File::open(&path).await.expect("Failed to open file");
+                let mut contents = Vec::new();
+                file.read_to_end(&mut contents).await.expect("Failed to read file");
+                
+                let post: RedditPost = serde_json::from_slice(&contents).expect("Unable to parse post");
+                
                 let community_name = post
                     .permalink
                     .strip_prefix("/r/")
@@ -259,7 +257,7 @@ async fn main() {
 
                         let title_trunc: String = post.title.chars().take(200).collect();
 
-                        let skip_dupe = match post_list.get(&(title_trunc.clone(), post.selftext.clone()))
+                        let (post_id, skip_dupe) = match post_list.get(&(title_trunc.clone(), post.selftext.clone()))
                         {
                             Some(existing_post_id) => {
                                 let post_comment_count = post_aggregates_list.get(existing_post_id).unwrap();
@@ -269,16 +267,16 @@ async fn main() {
                                     if !import_options.only_progress {
                                         info!("Skipping duplicate post {} with {} comments", post.title.clone(), post.comments.len());                                        
                                     }
-                                    true
+                                    (Some(existing_post_id), true)
                                 } else {
                                     if !import_options.only_progress {
                                         info!("Updating post {} ({} -> {} comments)", post.title.clone(), post_comment_count, loaded_post_comments);
                                     }
-                                    false
+                                    (Some(existing_post_id), false)
                                 }
                             }
                             None => {
-                                false
+                                (None, false)
                             }
                         };
 
@@ -323,6 +321,23 @@ async fn main() {
                                     .unwrap();
                             }
 
+                            // TODO: Don't remove entire post just to reinsert it
+
+                            if let Some(post_id) = post_id {
+                                info!("Updating existing post {}", post.title);
+                                
+                                Post::update(
+                                    &mut db_pool,
+                                    *post_id,
+                                    &PostUpdateForm {
+                                        deleted: Some(true),
+                                        ..Default::default()
+                                    },
+                                ).await.unwrap();
+                            }
+
+                            let lemmy_post_id = Post::create(&mut db_pool, &lemmy_post).await.unwrap().id;
+
                             for _ in 0..post.score.saturating_sub(voting_users.len().try_into().unwrap()) {
                                 let rand_string: String = rand::rng()
                                 .sample_iter(&Alphanumeric)
@@ -342,9 +357,6 @@ async fn main() {
 
                                 voting_users.push(user);
                             }
-
-                            let lemmy_post_id =
-                                Post::create(&mut db_pool, &lemmy_post).await.unwrap().id;
 
                             let mut voting_users_trunc = voting_users.clone();
 
@@ -384,8 +396,8 @@ async fn main() {
                                 );
                                 if !import_options.only_progress {
                                     info!(
-                                        "Inserting comment with score {} by '{}'",
-                                        comment.score, comment.author
+                                        "Inserting comment with score {} by '{}' on post '{}'",
+                                        comment.score, comment.author, post.title
                                     );
                                 }
 
@@ -484,6 +496,7 @@ async fn main() {
 
                                 let mut voting_users_trunc = voting_users.clone();
                                 voting_users_trunc.truncate(vote_count);
+                                
 
                                 // Determine the score each vote should get
                                 let score_value = if score > 0 { 1 } else { -1 };
@@ -498,11 +511,13 @@ async fn main() {
                                     })
                                     .collect();
 
-                                insert_into(comment_like::table)
+                                match insert_into(comment_like::table)
                                     .values(&like_forms)
                                     .execute(&mut conn)
-                                    .await
-                                    .unwrap();
+                                    .await {
+                                        Ok(_) => {},
+                                        Err(e) => {error!("Failed to insert comment_likes with:\nvoting_users_trunc: {:?}\n error: {e}", voting_users_trunc)}
+                                    }
 
                                 reddit_lemmy_id.insert(comment.id.clone(), new_lemmy_comment_id);
 
@@ -513,7 +528,9 @@ async fn main() {
                         error!("Lemmy community doesn't exist: {community_name}")
                     }}
                 }
-                pb.inc(1);
+                if !import_options.only_progress {
+                    pb.inc(1);
+                }
             }
         })
         .buffer_unordered(concurrency_limit)
