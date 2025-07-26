@@ -426,7 +426,7 @@ async fn process_post(
                     let mut conn = get_conn(&mut db_pool_for_conn).await.unwrap();
 
                     let new_username = Some(format!(
-                        "{} Post OP",
+                        "{} OP",
                         &import_options.username_override.clone().unwrap()
                     )); // this code sucks
 
