@@ -619,93 +619,97 @@ async fn process_post(
                                     reddit_lemmy_id
                                         .insert(comment.id.clone(), new_lemmy_comment_id);
 
-                                    new_lemmy_comment_id
+                                    Some(new_lemmy_comment_id)
                                 } else {
-                                    let lemmy_parent_id =
-                                        reddit_lemmy_id.get(parent_id.unwrap()).unwrap(); // Unwrap since walk_comments should always run in order
+                                    match reddit_lemmy_id.get(parent_id.unwrap()) {
+                                        Some(lemmy_parent_id) => {
+                                            let parent_comment_path =
+                                                Comment::read(&mut db_pool, *lemmy_parent_id)
+                                                    .await
+                                                    .unwrap()
+                                                    .unwrap()
+                                                    .path;
 
-                                    let parent_comment_path =
-                                        Comment::read(&mut db_pool, *lemmy_parent_id)
+                                            let new_lemmy_comment_id = Comment::create(
+                                                &mut db_pool,
+                                                &lemmy_comment,
+                                                Some(&parent_comment_path),
+                                            )
                                             .await
                                             .unwrap()
-                                            .unwrap()
-                                            .path;
+                                            .id;
 
-                                    let new_lemmy_comment_id = Comment::create(
-                                        &mut db_pool,
-                                        &lemmy_comment,
-                                        Some(&parent_comment_path),
-                                    )
-                                    .await
-                                    .unwrap()
-                                    .id;
+                                            reddit_lemmy_id
+                                                .insert(comment.id.clone(), new_lemmy_comment_id);
 
-                                    reddit_lemmy_id
-                                        .insert(comment.id.clone(), new_lemmy_comment_id);
-
-                                    new_lemmy_comment_id
+                                            Some(new_lemmy_comment_id)
+                                        }
+                                        None => None,
+                                    }
                                 }
                             };
 
                             // Apply score to comment
                             // TODO: Make a function, reduce uneeded DB requests, just clean up in general
 
-                            let score = comment.score;
-                            let vote_count = score.unsigned_abs() as usize;
+                            if let Some(new_lemmy_comment_id) = new_lemmy_comment_id {
+                                let score = comment.score;
+                                let vote_count = score.unsigned_abs() as usize;
 
-                            for _ in 0..vote_count.saturating_sub(voting_users.len()) {
-                                let rand_string: String = rand::thread_rng()
-                                    .sample_iter(&Alphanumeric)
-                                    .take(7)
-                                    .map(char::from)
+                                for _ in 0..vote_count.saturating_sub(voting_users.len()) {
+                                    let rand_string: String = rand::thread_rng()
+                                        .sample_iter(&Alphanumeric)
+                                        .take(7)
+                                        .map(char::from)
+                                        .collect();
+
+                                    let username = format!("voteuser-{rand_string}");
+                                    debug!("Adding {username} as a voteuser");
+
+                                    let user = get_or_create_user(
+                                        &None,
+                                        &username,
+                                        &site_view,
+                                        &mut db_pool,
+                                        &new_user_password_hash,
+                                    )
+                                    .await;
+
+                                    voting_users.push(user);
+                                }
+
+                                let mut voting_users_trunc = voting_users.clone();
+                                voting_users_trunc.truncate(vote_count);
+
+                                // Determine the score each vote should get
+                                let score_value = if score > 0 { 1 } else { -1 };
+
+                                let like_forms: Vec<_> = voting_users_trunc
+                                    .iter()
+                                    .map(|user| CommentLikeForm {
+                                        comment_id: new_lemmy_comment_id,
+                                        post_id: lemmy_post_id,
+                                        person_id: user.id,
+                                        score: score_value,
+                                    })
                                     .collect();
 
-                                let username = format!("voteuser-{rand_string}");
-                                debug!("Adding {username} as a voteuser");
-
-                                let user = get_or_create_user(
-                                    &None,
-                                    &username,
-                                    &site_view,
-                                    &mut db_pool,
-                                    &new_user_password_hash,
-                                )
-                                .await;
-
-                                voting_users.push(user);
-                            }
-
-                            let mut voting_users_trunc = voting_users.clone();
-                            voting_users_trunc.truncate(vote_count);
-
-                            // Determine the score each vote should get
-                            let score_value = if score > 0 { 1 } else { -1 };
-
-                            let like_forms: Vec<_> = voting_users_trunc
-                                .iter()
-                                .map(|user| CommentLikeForm {
-                                    comment_id: new_lemmy_comment_id,
-                                    post_id: lemmy_post_id,
-                                    person_id: user.id,
-                                    score: score_value,
-                                })
-                                .collect();
-
-                            match insert_into(comment_like::table)
-                                .values(&like_forms)
-                                .execute(&mut conn)
-                                .await
-                            {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    error!(
-                                        "Failed to insert comment_likes with:\nvoting_users_trunc: {:?}\n error: {e}",
-                                        voting_users_trunc
-                                    )
+                                match insert_into(comment_like::table)
+                                    .values(&like_forms)
+                                    .execute(&mut conn)
+                                    .await
+                                {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        error!(
+                                            "Failed to insert comment_likes with:\nvoting_users_trunc: {:?}\n error: {e}",
+                                            voting_users_trunc
+                                        )
+                                    }
                                 }
-                            }
 
-                            reddit_lemmy_id.insert(comment.id.clone(), new_lemmy_comment_id);
+                                reddit_lemmy_id.insert(comment.id.clone(), new_lemmy_comment_id);
+                            }
                         }
                     }
                 }
