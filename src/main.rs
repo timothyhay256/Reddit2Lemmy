@@ -423,12 +423,16 @@ async fn process_post(
                 let skip_dupe = {
                     if import_options.skip_low_score.unwrap_or(false) {
                         if post.score <= 0 { true } else { skip_dupe }
-                    } else if post.selftext == "[removed]" {
+                    } else if post.selftext == "[removed]" || post.title == "[deleted by user]" {
                         true
                     } else {
                         skip_dupe
                     }
                 };
+
+                if skip_dupe {
+                    info!("Skipping post...");
+                }
 
                 if !skip_dupe && !import_options.gen_users_only {
                     let owned_pool = owned_pool.unwrap();
